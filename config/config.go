@@ -95,6 +95,13 @@ type RemoteConfig struct {
 
 	// ReadOnly prevents writes to this remote.
 	ReadOnly bool `yaml:"read_only"`
+
+	// Passthrough disables caching for this remote entirely.  Files are always
+	// read directly from the source; no prefix bytes are pre-fetched and no
+	// full downloads are triggered.  Files still appear in directory listings
+	// and the location API (with state "uncached").  Useful for fast local or
+	// LAN remotes where caching adds no value.
+	Passthrough bool `yaml:"passthrough"`
 }
 
 // WebhookConfig enables an optional HTTP endpoint that receives Jellyfin

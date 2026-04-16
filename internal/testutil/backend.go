@@ -59,9 +59,10 @@ func (b *MemBackend) GetFile(path string) ([]byte, bool) {
 	return cp, true
 }
 
-func (b *MemBackend) Name() string     { return b.name }
-func (b *MemBackend) ReadOnly() bool   { return b.readOnly }
-func (b *MemBackend) Priority() int    { return b.priority }
+func (b *MemBackend) Name() string        { return b.name }
+func (b *MemBackend) ReadOnly() bool      { return b.readOnly }
+func (b *MemBackend) Priority() int       { return b.priority }
+func (b *MemBackend) Passthrough() bool   { return false }
 
 func (b *MemBackend) List(_ context.Context, dir string) ([]backend.Info, error) {
 	b.mu.RLock()

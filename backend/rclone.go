@@ -16,10 +16,11 @@ import (
 
 // RcloneBackend wraps an rclone fs.Fs as a Backend.
 type RcloneBackend struct {
-	name     string
-	fs       rfs.Fs
-	readOnly bool
-	priority int
+	name        string
+	fs          rfs.Fs
+	readOnly    bool
+	priority    int
+	passthrough bool
 }
 
 // NewRclone creates a Backend backed by the given rclone remote path.
@@ -30,16 +31,18 @@ func NewRclone(ctx context.Context, cfg config.RemoteConfig) (*RcloneBackend, er
 		return nil, fmt.Errorf("opening rclone remote %q: %w", cfg.RclonePath, err)
 	}
 	return &RcloneBackend{
-		name:     cfg.Name,
-		fs:       f,
-		readOnly: cfg.ReadOnly,
-		priority: cfg.Priority,
+		name:        cfg.Name,
+		fs:          f,
+		readOnly:    cfg.ReadOnly,
+		priority:    cfg.Priority,
+		passthrough: cfg.Passthrough,
 	}, nil
 }
 
-func (b *RcloneBackend) Name() string     { return b.name }
-func (b *RcloneBackend) ReadOnly() bool   { return b.readOnly }
-func (b *RcloneBackend) Priority() int    { return b.priority }
+func (b *RcloneBackend) Name() string        { return b.name }
+func (b *RcloneBackend) ReadOnly() bool      { return b.readOnly }
+func (b *RcloneBackend) Priority() int       { return b.priority }
+func (b *RcloneBackend) Passthrough() bool   { return b.passthrough }
 
 func (b *RcloneBackend) List(ctx context.Context, dir string) ([]Info, error) {
 	var infos []Info

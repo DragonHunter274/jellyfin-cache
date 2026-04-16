@@ -18,11 +18,12 @@ import (
 // Manager orchestrates the smart cache.  It is the primary entry point used
 // by the VFS layer.
 type Manager struct {
-	cfg    config.CacheConfig
-	db     *DB
-	store  *Store
-	union  *union.Union
-	log    *slog.Logger
+	cfg         config.CacheConfig
+	db          *DB
+	store       *Store
+	union       *union.Union
+	log         *slog.Logger
+	passthrough map[string]bool // backend name → passthrough flag
 
 	// Per-file download locks: prevents concurrent full downloads of the same file.
 	dlMu    sync.Mutex
@@ -73,18 +74,26 @@ func NewManager(cfg config.CacheConfig, u *union.Union, logger *slog.Logger) (*M
 		return nil, fmt.Errorf("invalid max_size %q: %w", cfg.MaxSize, err)
 	}
 
+	pt := make(map[string]bool)
+	for _, b := range u.Backends() {
+		if b.Passthrough() {
+			pt[b.Name()] = true
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
-		cfg:        cfg,
-		db:         db,
-		store:      store,
-		union:      u,
-		log:        logger,
-		dlLocks:    make(map[string]*downloadLock),
-		prefetchCh: make(chan string, 1024),
-		downloadCh: make(chan downloadJob, 256),
-		maxBytes:   maxBytes,
-		cancel:     cancel,
+		cfg:         cfg,
+		db:          db,
+		store:       store,
+		union:       u,
+		log:         logger,
+		passthrough: pt,
+		dlLocks:     make(map[string]*downloadLock),
+		prefetchCh:  make(chan string, 1024),
+		downloadCh:  make(chan downloadJob, 256),
+		maxBytes:    maxBytes,
+		cancel:      cancel,
 	}
 
 	// Start background workers.
@@ -127,6 +136,15 @@ func (m *Manager) Stat(ctx context.Context, path string) (*FileRecord, error) {
 		return nil, err
 	}
 	if rec != nil {
+		// Records created by the background scan (walkDir) may be missing
+		// RemoteName.  Populate it lazily so passthrough detection is correct.
+		if rec.RemoteName == "" {
+			if _, b, err2 := m.union.Stat(ctx, path); err2 == nil {
+				rec.RemoteName = b.Name()
+				rec.RemotePriority = b.Priority()
+				_ = m.db.Put(rec) // best-effort; ignore error
+			}
+		}
 		return rec, nil
 	}
 	// Not in DB yet – fetch from union and register.
@@ -159,11 +177,19 @@ func (m *Manager) Stat(ctx context.Context, path string) (*FileRecord, error) {
 //
 // On the first read that crosses the playback trigger threshold the full file
 // is scheduled for download.
+//
+// If the file's remote is marked passthrough, the read is served directly from
+// the union without touching the local cache.
 func (m *Manager) Open(ctx context.Context, path string) (io.ReadSeekCloser, error) {
 	rec, err := m.Stat(ctx, path)
 	if err != nil {
 		return nil, err
 	}
+
+	if m.passthrough[rec.RemoteName] {
+		return m.union.Open(ctx, path)
+	}
+
 	_ = m.db.TouchAccess(path)
 
 	return &CacheReader{
@@ -349,7 +375,7 @@ func (m *Manager) bootstrapPrefetch(ctx context.Context) {
 		return
 	}
 	for _, rec := range recs {
-		if rec.State == StateUncached && !rec.PrefetchDone {
+		if rec.State == StateUncached && !rec.PrefetchDone && !m.passthrough[rec.RemoteName] {
 			select {
 			case m.prefetchCh <- rec.Path:
 			case <-ctx.Done():
@@ -452,6 +478,9 @@ func (m *Manager) doPrefetch(ctx context.Context, path string) error {
 	}
 	if rec.State != StateUncached {
 		return nil // already cached
+	}
+	if m.passthrough[rec.RemoteName] {
+		return nil // passthrough remote: never cache
 	}
 	if !m.hasSpace(m.cfg.PrefixBytes) {
 		m.evictForSpace(m.cfg.PrefixBytes)

@@ -230,9 +230,10 @@ type errBackend struct {
 	priority int
 }
 
-func (e *errBackend) Name() string     { return e.name }
-func (e *errBackend) ReadOnly() bool   { return false }
-func (e *errBackend) Priority() int    { return e.priority }
+func (e *errBackend) Name() string        { return e.name }
+func (e *errBackend) ReadOnly() bool      { return false }
+func (e *errBackend) Priority() int       { return e.priority }
+func (e *errBackend) Passthrough() bool   { return false }
 func (e *errBackend) List(_ context.Context, _ string) ([]backend.Info, error) {
 	return nil, context.DeadlineExceeded
 }

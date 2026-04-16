@@ -50,4 +50,8 @@ type Backend interface {
 
 	// Priority returns the union resolution priority (lower = higher priority).
 	Priority() int
+
+	// Passthrough reports whether this backend bypasses the cache: reads are
+	// served directly from the remote and no data is ever stored locally.
+	Passthrough() bool
 }
