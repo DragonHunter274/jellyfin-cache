@@ -1,0 +1,31 @@
+# Apply this once to wire jellyfin-cache into your Flux setup:
+#   kubectl apply -f flux/flux-kustomization.yaml
+#
+# This tells Flux to watch the flux/jellyfin/ path in the repo, decrypt any
+# SOPS-encrypted files using the age key stored as "sops-age" in flux-system,
+# and reconcile the resources within.
+#
+# Prerequisites:
+#   1. Flux is bootstrapped (flux-system GitRepository named "flux-system" exists).
+#   2. Age private key is loaded:
+#        kubectl create secret generic sops-age \
+#          --namespace=flux-system \
+#          --from-file=age.agekey=/path/to/age.key
+#   3. rclone-secret.sops.yaml has been SOPS-encrypted (see that file for steps).
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: jellyfin
+  namespace: flux-system
+spec:
+  interval: 10m
+  path: ./flux/jellyfin
+  prune: true
+  wait: true
+  sourceRef:
+    kind: GitRepository
+    name: flux-system   # the GitRepository Flux bootstrap creates for this repo
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age

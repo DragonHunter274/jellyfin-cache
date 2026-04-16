@@ -1,0 +1,24 @@
+jellyfin-cache has been deployed.
+
+NFS endpoint (for Jellyfin's library path):
+  {{ include "jellyfin-cache.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:2049
+
+{{- if .Values.webhook.enabled }}
+
+Webhook endpoint:
+  http://{{ include "jellyfin-cache.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:8089{{ .Values.webhook.httpPath }}
+{{- end }}
+
+{{- if .Values.api.enabled }}
+
+API endpoint:
+  http://{{ include "jellyfin-cache.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:8090
+{{- end }}
+
+{{- if and (not .Values.rclone.existingSecret) (not .Values.rclone.configContent) }}
+
+WARNING: No rclone configuration provided.
+  Set rclone.existingSecret to the name of a Secret containing rclone.conf, or
+  provide rclone.configContent in your values (use a secrets manager — do not
+  commit credentials to source control).
+{{- end }}

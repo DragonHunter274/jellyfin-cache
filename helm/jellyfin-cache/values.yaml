@@ -1,0 +1,124 @@
+image:
+  repository: ghcr.io/your-github-user/jellyfin-cache
+  tag: ""   # defaults to .Chart.AppVersion
+  pullPolicy: Always
+
+# ---------------------------------------------------------------------------
+# rclone configuration
+#
+# Option A (recommended): create the secret out-of-band and reference it here.
+#   kubectl create secret generic my-rclone \
+#     --from-file=rclone.conf=$HOME/.config/rclone/rclone.conf
+#
+# Option B: paste the raw rclone.conf content below (use a sealed-secret /
+#   external-secrets operator to avoid committing credentials).
+# ---------------------------------------------------------------------------
+rclone:
+  # Name of an existing Secret with key "rclone.conf".
+  # When set, rclone.configContent is ignored.
+  existingSecret: ""
+
+  # Raw rclone.conf content.  Only used when existingSecret is empty.
+  # WARNING: do not commit real credentials; use a secrets manager.
+  configContent: ""
+
+# ---------------------------------------------------------------------------
+# Source remotes (rclone remote paths)
+# ---------------------------------------------------------------------------
+remotes:
+  - name: primary
+    rclonePath: "storagebox-media:"
+    priority: 0
+    readOnly: true
+
+# ---------------------------------------------------------------------------
+# Cache settings
+# ---------------------------------------------------------------------------
+cache:
+  maxSize: "200GB"
+  prefixBytes: 52428800        # 50 MiB
+  playbackTriggerBytes: 5242880  # 5 MiB
+  minPlayDuration: "10s"
+  fullTTL: "72h"
+  uploadTTL: "336h"
+  trickplaySeekThreshold: 3
+  trickplaySeekWindow: "10s"
+  prefetchWorkers: 4
+  downloadWorkers: 2
+  evictInterval: "5m"
+
+# ---------------------------------------------------------------------------
+# Mount — NFS is recommended for Kubernetes (no kernel modules required)
+# ---------------------------------------------------------------------------
+mount:
+  type: nfs
+  # FUSE mount path (only used when type=fuse; requires privileged container)
+  path: /mnt/jellyfin-cache
+  # NFS listen address (only used when type=nfs)
+  nfsListen: "0.0.0.0:2049"
+  allowOther: false
+
+# ---------------------------------------------------------------------------
+# Optional Jellyfin webhook
+# ---------------------------------------------------------------------------
+webhook:
+  enabled: false
+  listen: "0.0.0.0:8089"
+  httpPath: "/webhook"
+  secret: ""
+  pathField: "Path"
+  stripPrefix: ""
+  events:
+    - "PlaybackStart"
+
+# ---------------------------------------------------------------------------
+# Optional storage-location API
+# ---------------------------------------------------------------------------
+api:
+  enabled: false
+  listen: "0.0.0.0:8090"
+  secret: ""
+  adminSecret: ""
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+log:
+  level: info   # debug | info | warn | error
+
+# ---------------------------------------------------------------------------
+# Persistent storage for the cache
+# ---------------------------------------------------------------------------
+persistence:
+  enabled: true
+  size: 200Gi
+  storageClass: ""   # leave empty to use cluster default
+  accessMode: ReadWriteOnce
+  existingClaim: ""  # use a pre-existing PVC instead of creating one
+
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
+service:
+  type: ClusterIP
+
+# ---------------------------------------------------------------------------
+# Kubernetes resource settings
+# ---------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Required when mount.type=fuse
+podSecurityContext: {}
+containerSecurityContext: {}
+  # For FUSE uncomment:
+  # privileged: true

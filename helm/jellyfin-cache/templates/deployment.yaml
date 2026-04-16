@@ -1,0 +1,118 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "jellyfin-cache.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "jellyfin-cache.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "jellyfin-cache.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "jellyfin-cache.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Roll the deployment when the config or rclone secret changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if not .Values.rclone.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      containers:
+        - name: jellyfin-cache
+          image: "{{ .Values.image.repository }}:{{ include "jellyfin-cache.imageTag" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["mount", "--config", "/etc/jellyfin-cache/config.yaml"]
+
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+          ports:
+            - name: nfs
+              containerPort: 2049
+              protocol: TCP
+            {{- if .Values.webhook.enabled }}
+            - name: webhook
+              containerPort: 8089
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.api.enabled }}
+            - name: api
+              containerPort: 8090
+              protocol: TCP
+            {{- end }}
+
+          volumeMounts:
+            - name: config
+              mountPath: /etc/jellyfin-cache
+              readOnly: true
+            - name: rclone
+              mountPath: /etc/rclone
+              readOnly: true
+            - name: cache
+              mountPath: /data/cache
+            {{- if eq .Values.mount.type "fuse" }}
+            - name: fuse
+              mountPath: /dev/fuse
+            {{- end }}
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          readinessProbe:
+            tcpSocket:
+              port: nfs
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+          livenessProbe:
+            tcpSocket:
+              port: nfs
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
+
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "jellyfin-cache.fullname" . }}
+        - name: rclone
+          secret:
+            secretName: {{ include "jellyfin-cache.rcloneSecretName" . }}
+        - name: cache
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "jellyfin-cache.pvcName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if eq .Values.mount.type "fuse" }}
+        - name: fuse
+          hostPath:
+            path: /dev/fuse
+        {{- end }}
+
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

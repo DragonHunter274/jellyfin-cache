@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "jellyfin-cache.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "jellyfin-cache.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    rclone_config: /etc/rclone/rclone.conf
+
+    cache:
+      dir: /data/cache
+      max_size: {{ .Values.cache.maxSize | quote }}
+      prefix_bytes: {{ .Values.cache.prefixBytes | int }}
+      playback_trigger_bytes: {{ .Values.cache.playbackTriggerBytes | int }}
+      min_play_duration: {{ .Values.cache.minPlayDuration | quote }}
+      full_ttl: {{ .Values.cache.fullTTL | quote }}
+      upload_ttl: {{ .Values.cache.uploadTTL | quote }}
+      trickplay_seek_threshold: {{ .Values.cache.trickplaySeekThreshold }}
+      trickplay_seek_window: {{ .Values.cache.trickplaySeekWindow | quote }}
+      prefetch_workers: {{ .Values.cache.prefetchWorkers }}
+      download_workers: {{ .Values.cache.downloadWorkers }}
+      evict_interval: {{ .Values.cache.evictInterval | quote }}
+
+    remotes:
+    {{- range .Values.remotes }}
+      - name: {{ .name | quote }}
+        rclone_path: {{ .rclonePath | quote }}
+        priority: {{ .priority }}
+        read_only: {{ .readOnly }}
+    {{- end }}
+
+    mount:
+      type: {{ .Values.mount.type | quote }}
+      path: {{ .Values.mount.path | quote }}
+      listen: {{ .Values.mount.nfsListen | quote }}
+      allow_other: {{ .Values.mount.allowOther }}
+
+    webhook:
+      enabled: {{ .Values.webhook.enabled }}
+      listen: {{ .Values.webhook.listen | quote }}
+      http_path: {{ .Values.webhook.httpPath | quote }}
+      secret: {{ .Values.webhook.secret | quote }}
+      path_field: {{ .Values.webhook.pathField | quote }}
+      strip_prefix: {{ .Values.webhook.stripPrefix | quote }}
+      events:
+      {{- range .Values.webhook.events }}
+        - {{ . | quote }}
+      {{- end }}
+
+    api:
+      enabled: {{ .Values.api.enabled }}
+      listen: {{ .Values.api.listen | quote }}
+      secret: {{ .Values.api.secret | quote }}
+      admin_secret: {{ .Values.api.adminSecret | quote }}
+
+    log:
+      level: {{ .Values.log.level | quote }}
+      file: ""

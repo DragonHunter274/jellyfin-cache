@@ -1,0 +1,6 @@
+apiVersion: v2
+name: jellyfin-cache
+description: Smart read-ahead cache daemon for Jellyfin media libraries
+type: application
+version: 0.1.0
+appVersion: "latest"
