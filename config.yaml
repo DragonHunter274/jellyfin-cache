@@ -1,0 +1,160 @@
+# jellyfin-cache example configuration
+# Copy to /etc/jellyfin-cache/config.yaml and adjust as needed.
+
+# Path to the rclone.conf used for remote credentials.
+# If empty, rclone's default location is used (~/.config/rclone/rclone.conf).
+rclone_config: ""
+
+cache:
+  # Directory to store cached data and the metadata database.
+  dir: /home/simon/Projects/jellyfin-cache/cache-folder
+
+  # Maximum total disk usage for the cache.
+  max_size: "200GB"
+
+  # Bytes to pre-cache at the front of every media file.
+  # 50 MiB ≈ first 3–5 minutes at typical streaming bitrates.
+  prefix_bytes: 52428800   # 50 MiB
+
+  # Both of the following thresholds must be satisfied before a full download
+  # is triggered.  A seek past the prefix always triggers immediately
+  # (seeks never happen during scans, only during real playback/transcoding).
+
+  # Minimum bytes read through one handle before triggering a full download.
+  playback_trigger_bytes: 5242880   # 5 MiB
+
+  # Minimum time the file handle must be continuously open and reading.
+  # This is the primary guard against Jellyfin library scans: ffprobe opens
+  # every file briefly (1–3 s) to read metadata, then closes it.  Real
+  # playback keeps the handle open for minutes.
+  min_play_duration: "10s"
+
+  # How long a fully-downloaded file stays in cache before being truncated
+  # back to prefix-only.
+  full_ttl: "72h"
+
+  # Extended TTL for files that were uploaded *through* the cache.
+  upload_ttl: "336h"   # 2 weeks
+
+  # Trickplay suppression.
+  # Jellyfin's trickplay generator seeks to many positions throughout the file
+  # in rapid succession (~1 seek/s) to extract thumbnail frames.  If this many
+  # seeks occur within the window the handle is classified as trickplay and no
+  # full download is triggered.  New uploads are unaffected (already fully
+  # cached).  Webhook-triggered downloads are also unaffected.
+  trickplay_seek_threshold: 3
+  trickplay_seek_window: "10s"
+
+  # Background worker counts.
+  prefetch_workers: 4
+  download_workers: 2
+
+  # How often the eviction / expiry check runs.
+  evict_interval: "5m"
+
+# One or more source remotes to merge.  Any rclone remote path works here –
+# local paths, Google Drive, S3, SFTP, Backblaze B2, etc.
+remotes:
+  - name: primary
+    rclone_path: "storagebox-media:"  # e.g. an rclone Google Drive remote
+    priority: 0                  # lowest = highest priority
+    read_only: true
+
+
+  # Local path example:
+  # - name: local
+  #   rclone_path: "/mnt/nas/media"
+  #   priority: 2
+  #   read_only: true
+
+mount:
+  # "fuse" mounts a local directory; "nfs" exposes an NFS server.
+  type: nfs
+
+  # FUSE mount point (must exist or will be created).
+  path: /home/simon/Projects/jellyfin-cache/mnt
+
+  # NFS listen address (only used when type = "nfs").
+  listen: "127.0.0.1:2049"
+
+  # Pass allow_other to FUSE so Jellyfin (running as a different user) can
+  # access the mount.  Requires user_allow_other in /etc/fuse.conf.
+  allow_other: false
+
+################################################################################
+# Jellyfin webhook (optional)
+#
+# When enabled, jellyfin-cache listens for Jellyfin playback events and
+# triggers full downloads immediately, replacing the timer/bytes heuristic.
+#
+# Jellyfin setup:
+#   1. Dashboard → Plugins → Catalog → search "Webhook" → install.
+#   2. Plugins → Webhook → Add destination:
+#        URL:    http://localhost:8089/webhook?secret=CHANGE_ME
+#        Notification type: Playback Start  (optionally also Playback Unpause)
+#   3. Leave template as "Generic" (it emits a top-level "Path" field).
+#   4. Save and restart Jellyfin.
+################################################################################
+webhook:
+  enabled: false
+  listen: "127.0.0.1:8089"
+  http_path: "/webhook"
+
+  # Optional shared secret validated against Authorization: Bearer <secret>
+  # or the ?secret= query parameter.
+  secret: ""
+
+  # Dot-notation path to the file path field in the JSON payload.
+  # "Path" works with Jellyfin's built-in Generic webhook template.
+  path_field: "Path"
+
+  # Strip this filesystem prefix so the path matches the VFS root.
+  # e.g. if Jellyfin reports "/mnt/nas/Movies/film.mkv" but the VFS
+  # exposes "Movies/film.mkv", set this to "/mnt/nas/".
+  strip_prefix: ""
+
+  # Which Jellyfin notification types trigger a download.
+  # Leave at the default unless you also want to warm on Resume.
+  events:
+    - "PlaybackStart"
+    # - "PlaybackUnpause"
+
+################################################################################
+# Storage-location API (optional)
+#
+# When enabled, exposes a read-only HTTP API for querying which storage tier a
+# file is on.  Use this to add cache-state badges to the Jellyfin interface
+# (e.g. via a browser extension or Jellyfin plugin).
+#
+# Endpoints:
+#   GET /api/location?path=Movies/Inception.mkv
+#       Returns JSON with cache_state, cached_bytes, size, remote_name and
+#       remote_priority for that file.  404 if not yet tracked.
+#
+#   GET /api/files
+#       Returns a JSON array of the above for every tracked file.
+#
+# cache_state values:
+#   "uncached"    – no local data; reads stream directly from the remote
+#   "prefix"      – first N bytes cached (fast start); rest streams from remote
+#   "downloading" – full background download in progress
+#   "full"        – entire file is cached locally
+#
+# remote_priority: 0 = highest-priority (fastest) backend; higher = slower/cold
+################################################################################
+api:
+  enabled: false
+  listen: "127.0.0.1:8090"
+
+  # Guards GET /api/location and GET /api/files.
+  # Leave empty to allow unauthenticated reads.
+  secret: ""
+
+  # Guards POST /api/cache and POST /api/evict.
+  # If empty, those endpoints are disabled entirely (return 403).
+  # Must be different from secret.
+  admin_secret: ""
+
+log:
+  level: info     # debug | info | warn | error
+  file: ""        # empty = stderr

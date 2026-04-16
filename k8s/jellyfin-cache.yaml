@@ -1,0 +1,215 @@
+# jellyfin-cache Kubernetes manifests
+# Single-node cluster deployment (no DB concurrency concerns)
+#
+# Before applying:
+#   1. Push to main (or tag a release) — the GitHub Action builds and pushes
+#        ghcr.io/YOUR_GITHUB_USER/jellyfin-cache:latest automatically.
+#        For local builds: docker build -t ghcr.io/YOUR_GITHUB_USER/jellyfin-cache:latest .
+#
+#   2. Create the rclone Secret from your existing rclone.conf:
+#        kubectl create secret generic jellyfin-cache-rclone \
+#          --from-file=rclone.conf=$HOME/.config/rclone/rclone.conf \
+#          -n jellyfin
+#
+#   3. Edit the ConfigMap below to match your remotes and preferences.
+#
+#   4. Apply:
+#        kubectl apply -f k8s/jellyfin-cache.yaml
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jellyfin
+
+---
+# rclone.conf — create via kubectl (see instructions above), not checked in.
+# This placeholder exists so the Deployment can reference the volume;
+# kubectl will error if the secret is missing.
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: jellyfin-cache-rclone
+#   namespace: jellyfin
+# type: Opaque
+# data:
+#   rclone.conf: <base64-encoded rclone.conf>
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jellyfin-cache-config
+  namespace: jellyfin
+data:
+  config.yaml: |
+    # Path to the rclone.conf mounted from the Secret.
+    rclone_config: /etc/rclone/rclone.conf
+
+    cache:
+      dir: /data/cache
+      max_size: "200GB"
+      prefix_bytes: 52428800       # 50 MiB
+      playback_trigger_bytes: 5242880  # 5 MiB
+      min_play_duration: "10s"
+      full_ttl: "72h"
+      upload_ttl: "336h"
+      trickplay_seek_threshold: 3
+      trickplay_seek_window: "10s"
+      prefetch_workers: 4
+      download_workers: 2
+      evict_interval: "5m"
+
+    remotes:
+      - name: primary
+        rclone_path: "storagebox-media:"   # <-- adjust to your rclone remote
+        priority: 0
+        read_only: true
+
+    mount:
+      type: nfs
+      # Listen on all interfaces so Jellyfin (in another pod) can reach us.
+      listen: "0.0.0.0:2049"
+
+    webhook:
+      enabled: false
+      listen: "0.0.0.0:8089"
+      http_path: "/webhook"
+      secret: ""
+      path_field: "Path"
+      strip_prefix: ""
+      events:
+        - "PlaybackStart"
+
+    api:
+      enabled: false
+      listen: "0.0.0.0:8090"
+      secret: ""
+      admin_secret: ""
+
+    log:
+      level: info
+      file: ""
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jellyfin-cache-data
+  namespace: jellyfin
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 200Gi
+  # storageClassName: ""  # uncomment and set if your cluster requires a specific class
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jellyfin-cache
+  namespace: jellyfin
+  labels:
+    app: jellyfin-cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jellyfin-cache
+  strategy:
+    type: Recreate   # only one replica; Recreate avoids two pods fighting over the PVC
+  template:
+    metadata:
+      labels:
+        app: jellyfin-cache
+    spec:
+      containers:
+        - name: jellyfin-cache
+          image: ghcr.io/YOUR_GITHUB_USER/jellyfin-cache:latest
+          imagePullPolicy: Always
+          args: ["mount", "--config", "/etc/jellyfin-cache/config.yaml"]
+
+          ports:
+            - name: nfs
+              containerPort: 2049
+              protocol: TCP
+            - name: webhook
+              containerPort: 8089
+              protocol: TCP
+            - name: api
+              containerPort: 8090
+              protocol: TCP
+
+          volumeMounts:
+            - name: config
+              mountPath: /etc/jellyfin-cache
+              readOnly: true
+            - name: rclone
+              mountPath: /etc/rclone
+              readOnly: true
+            - name: cache
+              mountPath: /data/cache
+
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 2000m
+              memory: 2Gi
+
+          # NFS server takes a moment to start; give it time before routing traffic.
+          readinessProbe:
+            tcpSocket:
+              port: nfs
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+          livenessProbe:
+            tcpSocket:
+              port: nfs
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
+
+      volumes:
+        - name: config
+          configMap:
+            name: jellyfin-cache-config
+        - name: rclone
+          secret:
+            secretName: jellyfin-cache-rclone
+        - name: cache
+          persistentVolumeClaim:
+            claimName: jellyfin-cache-data
+
+---
+# ClusterIP service — accessible within the cluster as:
+#   jellyfin-cache.jellyfin.svc.cluster.local:2049  (NFS)
+#   jellyfin-cache.jellyfin.svc.cluster.local:8089  (webhook, if enabled)
+#   jellyfin-cache.jellyfin.svc.cluster.local:8090  (API, if enabled)
+apiVersion: v1
+kind: Service
+metadata:
+  name: jellyfin-cache
+  namespace: jellyfin
+  labels:
+    app: jellyfin-cache
+spec:
+  selector:
+    app: jellyfin-cache
+  ports:
+    - name: nfs
+      port: 2049
+      targetPort: nfs
+      protocol: TCP
+    - name: webhook
+      port: 8089
+      targetPort: webhook
+      protocol: TCP
+    - name: api
+      port: 8090
+      targetPort: api
+      protocol: TCP
