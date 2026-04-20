@@ -30,6 +30,7 @@ remotes:
     rclonePath: "storagebox-media:"
     priority: 0
     readOnly: true
+    passthrough: false  # set true to bypass caching entirely for this remote
 
 # ---------------------------------------------------------------------------
 # Cache settings

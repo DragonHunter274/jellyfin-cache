@@ -479,6 +479,16 @@ func (m *Manager) doPrefetch(ctx context.Context, path string) error {
 	if rec.State != StateUncached {
 		return nil // already cached
 	}
+	// RemoteName is empty for records created by the background scan (walkDir
+	// doesn't resolve individual backends).  Look it up now so the passthrough
+	// check below is accurate, and persist it so this only happens once.
+	if rec.RemoteName == "" {
+		if _, b, err2 := m.union.Stat(ctx, path); err2 == nil {
+			rec.RemoteName = b.Name()
+			rec.RemotePriority = b.Priority()
+			_ = m.db.Put(rec)
+		}
+	}
 	if m.passthrough[rec.RemoteName] {
 		return nil // passthrough remote: never cache
 	}

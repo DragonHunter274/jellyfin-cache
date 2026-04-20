@@ -29,6 +29,7 @@ data:
         rclone_path: {{ .rclonePath | quote }}
         priority: {{ .priority }}
         read_only: {{ .readOnly }}
+        passthrough: {{ .passthrough | default false }}
     {{- end }}
 
     mount:
