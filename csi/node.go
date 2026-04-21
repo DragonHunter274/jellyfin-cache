@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"strings"
 	"syscall"
@@ -78,7 +79,13 @@ func mountNFS(server, target, port string, readonly bool) error {
 	if port == "" {
 		port = "2049"
 	}
-	opts := fmt.Sprintf("port=%s,mountport=%s,nfsvers=3,nolock", port, port)
+	// The kernel NFS client requires addr= when using text-format mount options;
+	// it cannot resolve DNS itself, which would cause EINVAL.
+	addrs, err := net.LookupHost(server)
+	if err != nil {
+		return fmt.Errorf("resolving %q: %w", server, err)
+	}
+	opts := fmt.Sprintf("addr=%s,port=%s,mountport=%s,nfsvers=3,proto=tcp,mountproto=tcp,nolock", addrs[0], port, port)
 	if readonly {
 		opts += ",ro"
 	}
