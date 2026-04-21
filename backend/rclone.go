@@ -182,7 +182,24 @@ func (r *rcloneReadSeeker) Seek(offset int64, whence int) (int64, error) {
 		return 0, fmt.Errorf("negative seek position")
 	}
 
-	// Re-open with Range header equivalent (rclone Options).
+	// No-op seek.
+	if abs == r.offset {
+		return abs, nil
+	}
+
+	// Small forward seek: discard bytes rather than reopening the connection.
+	// NFS sequential reads (ReadAt calls with monotonically increasing offsets)
+	// hit this path and avoid creating a new remote connection per block.
+	const discardThreshold = 512 * 1024
+	if abs > r.offset && abs-r.offset <= discardThreshold {
+		if _, err := io.CopyN(io.Discard, r.rc, abs-r.offset); err == nil {
+			r.offset = abs
+			return abs, nil
+		}
+		// If discard fails, fall through to reopen.
+	}
+
+	// Backward seek or large forward seek: reopen at the new offset.
 	_ = r.rc.Close()
 	rc, err := r.obj.Open(r.ctx, &rfs.RangeOption{Start: abs, End: -1})
 	if err != nil {
