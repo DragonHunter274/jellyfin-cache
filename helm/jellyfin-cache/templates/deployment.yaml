@@ -43,6 +43,9 @@ spec:
             - name: nfs
               containerPort: 2049
               protocol: TCP
+              {{- if .Values.nfs.hostPort }}
+              hostPort: 2049
+              {{- end }}
             {{- if .Values.webhook.enabled }}
             - name: webhook
               containerPort: 8089

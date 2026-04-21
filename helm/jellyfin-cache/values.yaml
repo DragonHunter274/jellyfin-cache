@@ -59,6 +59,12 @@ mount:
   nfsListen: "0.0.0.0:2049"
   allowOther: false
 
+# Expose the NFS port directly on the node so kubelet can mount it via hostPort.
+# Required when the cluster's kube-proxy does not route ClusterIP traffic from
+# the host network namespace (common in k3s).
+nfs:
+  hostPort: false
+
 # ---------------------------------------------------------------------------
 # Optional Jellyfin webhook
 # ---------------------------------------------------------------------------
