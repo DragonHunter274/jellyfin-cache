@@ -27,7 +27,10 @@ func ServeNFS(ctx context.Context, mgr *cache.Manager, cfg config.MountConfig, l
 
 	billyFS := vfs.New(ctx, mgr)
 	handler := nfshelper.NewNullAuthHandler(billyFS)
-	cacheHelper := nfshelper.NewCachingHandler(handler, 1024)
+	// 1024 is far too small: NFS3 READDIRPLUS creates a handle for every file
+	// in every directory during a library scan, evicting video handles before
+	// playback starts and causing NFS3ERR_STALE → EIO on the client.
+	cacheHelper := nfshelper.NewCachingHandler(handler, 1<<17) // 131072
 
 	errCh := make(chan error, 1)
 	go func() {
