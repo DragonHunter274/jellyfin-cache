@@ -149,46 +149,99 @@ func lastName(path string) string {
 	return path
 }
 
+// readAheadSize is the number of bytes fetched per remote read. A single large
+// read lets rclone pipeline SFTP/HTTP requests internally, which is far more
+// efficient than many small reads each paying full per-request RTT overhead.
+const readAheadSize = 4 * 1024 * 1024 // 4 MiB
+
 // rcloneReadSeeker adapts rclone's io.ReadCloser into io.ReadSeekCloser.
 //
-// The connection is opened lazily on the first Read so that callers that seek
-// before reading (e.g. go-nfs onRead: Open → ReadAt(buf, offset) → Close) get
-// a single range-request starting at the correct offset instead of two requests
-// (one from position 0, one reopened at the seek target).
+// Connection is opened lazily on first Read (avoiding a redundant open-at-0
+// when callers seek before reading, as go-nfs does for each READ RPC).
+//
+// A read-ahead buffer absorbs the per-request overhead of protocols like SFTP
+// that pipeline concurrent sub-requests over a single stream: the first Read
+// at any offset fetches readAheadSize bytes in one shot; sequential Reads are
+// then served from memory. A seek within the already-buffered window is free.
 type rcloneReadSeeker struct {
 	rc     io.ReadCloser // nil until first Read
 	obj    rfs.Object
 	ctx    context.Context
 	offset int64
+
+	ra    []byte // read-ahead buffer
+	raOff int64  // file offset of ra[0]; -1 = invalid
+	raLen int    // valid bytes in ra
 }
 
-func (r *rcloneReadSeeker) ensureOpen() error {
+// inBuffer reports whether offset abs is within the valid read-ahead window.
+func (r *rcloneReadSeeker) inBuffer(abs int64) bool {
+	return r.raLen > 0 && abs >= r.raOff && abs < r.raOff+int64(r.raLen)
+}
+
+func (r *rcloneReadSeeker) openAt(abs int64) error {
 	if r.rc != nil {
-		return nil
+		_ = r.rc.Close()
+		r.rc = nil
 	}
 	var (
 		rc  io.ReadCloser
 		err error
 	)
-	if r.offset == 0 {
+	if abs == 0 {
 		rc, err = r.obj.Open(r.ctx)
 	} else {
-		rc, err = r.obj.Open(r.ctx, &rfs.RangeOption{Start: r.offset, End: -1})
+		rc, err = r.obj.Open(r.ctx, &rfs.RangeOption{Start: abs, End: -1})
 	}
 	if err != nil {
-		return fmt.Errorf("open at %d: %w", r.offset, err)
+		return fmt.Errorf("open at %d: %w", abs, err)
 	}
 	r.rc = rc
+	r.offset = abs
+	return nil
+}
+
+// fillBuffer opens the remote at r.offset (if needed) and reads readAheadSize
+// bytes into the buffer. It must be called when the buffer doesn't cover r.offset.
+func (r *rcloneReadSeeker) fillBuffer() error {
+	if r.rc == nil {
+		if err := r.openAt(r.offset); err != nil {
+			return err
+		}
+	}
+	if cap(r.ra) < readAheadSize {
+		r.ra = make([]byte, readAheadSize)
+	}
+	buf := r.ra[:readAheadSize]
+	n, err := io.ReadFull(r.rc, buf)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		r.raLen = 0
+		r.raOff = -1
+		return err
+	}
+	r.raOff = r.offset
+	r.raLen = n
 	return nil
 }
 
 func (r *rcloneReadSeeker) Read(p []byte) (int, error) {
-	if err := r.ensureOpen(); err != nil {
-		return 0, err
+	if !r.inBuffer(r.offset) {
+		if err := r.fillBuffer(); err != nil {
+			return 0, err
+		}
+		// fillBuffer may have read 0 bytes at EOF.
+		if r.raLen == 0 {
+			return 0, io.EOF
+		}
 	}
-	n, err := r.rc.Read(p)
+	bufStart := int(r.offset - r.raOff)
+	avail := r.ra[bufStart:r.raLen]
+	n := copy(p, avail)
 	r.offset += int64(n)
-	return n, err
+	if n == 0 {
+		return 0, io.EOF
+	}
+	return n, nil
 }
 
 func (r *rcloneReadSeeker) Seek(offset int64, whence int) (int64, error) {
@@ -207,39 +260,32 @@ func (r *rcloneReadSeeker) Seek(offset int64, whence int) (int64, error) {
 	if abs < 0 {
 		return 0, fmt.Errorf("negative seek position")
 	}
-
-	// No-op seek — covers the sequential ReadAt pattern after connection opens.
 	if abs == r.offset {
 		return abs, nil
 	}
-
-	// Not yet connected: just update the start offset for free.
-	if r.rc == nil {
+	// If the target is within the buffer we can just move the cursor —
+	// no network I/O required.
+	if r.inBuffer(abs) {
 		r.offset = abs
 		return abs, nil
 	}
-
-	// Small forward seek on an open connection: discard rather than reopen.
-	const discardThreshold = 512 * 1024
-	if abs > r.offset && abs-r.offset <= discardThreshold {
-		if _, err := io.CopyN(io.Discard, r.rc, abs-r.offset); err == nil {
-			r.offset = abs
-			return abs, nil
-		}
-		// discard failed — fall through to close+lazy-reopen
+	// Outside the buffer: invalidate and reopen lazily on next Read.
+	r.raLen = 0
+	r.raOff = -1
+	if r.rc != nil {
+		_ = r.rc.Close()
+		r.rc = nil
 	}
-
-	// Backward seek or large forward seek: close and let ensureOpen reopen at
-	// the new position on the next Read.
-	_ = r.rc.Close()
-	r.rc = nil
 	r.offset = abs
 	return abs, nil
 }
 
 func (r *rcloneReadSeeker) Close() error {
+	r.raLen = 0
 	if r.rc == nil {
 		return nil
 	}
-	return r.rc.Close()
+	err := r.rc.Close()
+	r.rc = nil
+	return err
 }
