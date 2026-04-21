@@ -24,6 +24,7 @@ import (
 const (
 	testRemote    = "storagebox-media"
 	testFile      = "TV/The Rookie/Season 8/The Rookie - S08E10 - His Name Was Martin WEBRip-1080p.mkv"
+	avatarFile    = "Movies/Avatar Fire and Ash (2025)/Avatar Fire and Ash (2025) WEBDL-2160p.mkv"
 	nfsBlockSize  = 128 * 1024 // 128 KiB — go-nfs default read size
 	nfsTestBlocks = 16         // 2 MiB total
 )
@@ -116,4 +117,71 @@ func TestVFS_NFSReadPattern_Pool(t *testing.T) {
 	if !bytes.Equal(ref, got) {
 		t.Error("pooled NFS pattern: data does not match reference")
 	}
+}
+
+// TestVFS_Avatar simulates exactly what go-nfs does when Jellyfin opens
+// a large 4K file: Stat → Open → ReadAt(header) → Seek(EOF) → ReadAt(tail) → Close.
+func TestVFS_Avatar(t *testing.T) {
+	fs := newTestFS(t)
+
+	// 1. Stat — go-nfs calls this before and after every READ RPC.
+	info, err := fs.Stat(avatarFile)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	t.Logf("size=%d (%d GiB)", info.Size(), info.Size()>>30)
+	if info.Size() < 1<<30 {
+		t.Errorf("suspiciously small size %d", info.Size())
+	}
+
+	// 2. Read the first 512 KiB (container header).
+	header := make([]byte, 512*1024)
+	{
+		f, err := fs.Open(avatarFile)
+		if err != nil {
+			t.Fatalf("Open (header): %v", err)
+		}
+		n, err := f.ReadAt(header, 0)
+		f.Close()
+		if err != nil && err != io.EOF {
+			t.Fatalf("ReadAt header: %v (read %d bytes)", err, n)
+		}
+		t.Logf("header read: %d bytes", n)
+	}
+
+	// 3. Seek near EOF and read a chunk — ffprobe locates the moov/cues atom.
+	tail := make([]byte, 512*1024)
+	tailOff := info.Size() - int64(len(tail))
+	{
+		f, err := fs.Open(avatarFile)
+		if err != nil {
+			t.Fatalf("Open (tail): %v", err)
+		}
+		n, err := f.ReadAt(tail, tailOff)
+		f.Close()
+		if err != nil && err != io.EOF {
+			t.Fatalf("ReadAt tail at %d: %v (read %d bytes)", tailOff, err, n)
+		}
+		t.Logf("tail read: %d bytes at offset %d", n, tailOff)
+	}
+
+	// 4. Sequential NFS pattern on the first 4 MiB — playback start.
+	const playBlocks = 32
+	start := time.Now()
+	for i := 0; i < playBlocks; i++ {
+		off := int64(i * nfsBlockSize)
+		f, err := fs.Open(avatarFile)
+		if err != nil {
+			t.Fatalf("block %d Open: %v", i, err)
+		}
+		buf := make([]byte, nfsBlockSize)
+		n, err := f.ReadAt(buf, off)
+		f.Close()
+		if err != nil && err != io.EOF {
+			t.Fatalf("block %d ReadAt at %d: %v (read %d)", i, off, err, n)
+		}
+	}
+	elapsed := time.Since(start)
+	mbps := float64(playBlocks*nfsBlockSize) / elapsed.Seconds() / 1024 / 1024
+	t.Logf("playback start: %d blocks in %s (%.1f MB/s)", playBlocks, elapsed, mbps)
 }

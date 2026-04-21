@@ -400,7 +400,7 @@ func (m *Manager) walkAndScan(ctx context.Context) {
 }
 
 func (m *Manager) walkDir(ctx context.Context, dir string, queued *int) error {
-	entries, err := m.union.List(ctx, dir)
+	entries, err := m.union.ListTagged(ctx, dir)
 	if err != nil {
 		if dir == "" {
 			m.log.Error("remote scan: cannot list root directory — check that your rclone_path ends with a colon (e.g. \"storagebox-media:\") and the remote is reachable", "err", err)
@@ -418,7 +418,6 @@ func (m *Manager) walkDir(ctx context.Context, dir string, queued *int) error {
 		if entry.IsDir {
 			if err := m.walkDir(ctx, entry.Path, queued); err != nil {
 				m.log.Warn("scan: failed listing dir", "path", entry.Path, "err", err)
-				// continue scanning other directories
 			}
 			continue
 		}
@@ -432,12 +431,14 @@ func (m *Manager) walkDir(ctx context.Context, dir string, queued *int) error {
 			continue // already known; bootstrapPrefetch handles re-queuing
 		}
 		rec = &FileRecord{
-			Path:       entry.Path,
-			Size:       entry.Size,
-			ModTime:    entry.ModTime,
-			State:      StateUncached,
-			Kind:       KindRemote,
-			LastAccess: time.Now(),
+			Path:           entry.Path,
+			Size:           entry.Size,
+			ModTime:        entry.ModTime,
+			State:          StateUncached,
+			Kind:           KindRemote,
+			LastAccess:     time.Now(),
+			RemoteName:     entry.BackendName,
+			RemotePriority: entry.BackendPriority,
 		}
 		if err := m.db.Put(rec); err != nil {
 			m.log.Warn("scan: db put failed", "path", entry.Path, "err", err)
@@ -446,8 +447,6 @@ func (m *Manager) walkDir(ctx context.Context, dir string, queued *int) error {
 		select {
 		case m.prefetchCh <- entry.Path:
 		default:
-			// Channel full; the file is in the DB and bootstrapPrefetch will
-			// pick it up on the next restart.
 		}
 		*queued++
 	}

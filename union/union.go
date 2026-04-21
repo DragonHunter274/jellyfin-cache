@@ -39,13 +39,22 @@ func New(backends []backend.Backend) *Union {
 // Backends returns the sorted backend list (read-only).
 func (u *Union) Backends() []backend.Backend { return u.backends }
 
-// List merges directory listings from all backends.
+// TaggedInfo is an Info entry annotated with its source backend.
+type TaggedInfo struct {
+	backend.Info
+	BackendName     string
+	BackendPriority int
+	Passthrough     bool
+}
+
+// ListTagged merges directory listings from all backends and retains the
+// source backend metadata for each entry so callers can record RemoteName
+// without a follow-up Stat call.
 // Files that appear on multiple backends are deduplicated: the entry from
-// the highest-priority backend wins.
-// Returns an error only when every backend fails; a partial result from at
-// least one healthy backend is returned without error.
-func (u *Union) List(ctx context.Context, dir string) ([]backend.Info, error) {
+// the highest-priority backend (lowest Priority number) wins.
+func (u *Union) ListTagged(ctx context.Context, dir string) ([]TaggedInfo, error) {
 	type result struct {
+		b     backend.Backend
 		infos []backend.Info
 		err   error
 	}
@@ -56,42 +65,65 @@ func (u *Union) List(ctx context.Context, dir string) ([]backend.Info, error) {
 		go func(idx int, b backend.Backend) {
 			defer wg.Done()
 			infos, err := b.List(ctx, dir)
-			results[idx] = result{infos, err}
+			results[idx] = result{b: b, infos: infos, err: err}
 		}(i, b)
 	}
 	wg.Wait()
 
 	// Merge: highest-priority (index 0) wins on collision.
-	seen := make(map[string]backend.Info)
+	type entry struct {
+		info backend.Info
+		b    backend.Backend
+	}
+	seen := make(map[string]entry)
 	var lastErr error
 	anyOK := false
 	for _, r := range results {
 		if r.err != nil {
 			lastErr = r.err
-			continue // backend unavailable; skip
+			continue
 		}
 		anyOK = true
 		for _, info := range r.infos {
 			if _, exists := seen[info.Path]; !exists {
-				seen[info.Path] = info
+				seen[info.Path] = entry{info: info, b: r.b}
 			}
 		}
 	}
-
-	// If every backend failed, surface the error so callers can distinguish
-	// "directory is empty" from "listing failed".
 	if !anyOK && lastErr != nil {
 		return nil, lastErr
 	}
 
-	merged := make([]backend.Info, 0, len(seen))
-	for _, info := range seen {
-		merged = append(merged, info)
+	merged := make([]TaggedInfo, 0, len(seen))
+	for _, e := range seen {
+		merged = append(merged, TaggedInfo{
+			Info:            e.info,
+			BackendName:     e.b.Name(),
+			BackendPriority: e.b.Priority(),
+			Passthrough:     e.b.Passthrough(),
+		})
 	}
 	sort.Slice(merged, func(i, j int) bool {
 		return merged[i].Name < merged[j].Name
 	})
 	return merged, nil
+}
+
+// List merges directory listings from all backends.
+// Files that appear on multiple backends are deduplicated: the entry from
+// the highest-priority backend wins.
+// Returns an error only when every backend fails; a partial result from at
+// least one healthy backend is returned without error.
+func (u *Union) List(ctx context.Context, dir string) ([]backend.Info, error) {
+	tagged, err := u.ListTagged(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	infos := make([]backend.Info, len(tagged))
+	for i, t := range tagged {
+		infos[i] = t.Info
+	}
+	return infos, nil
 }
 
 // Stat returns the Info for path from the highest-priority backend that has it.
