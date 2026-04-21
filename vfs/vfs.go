@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"sync"
 	"time"
 
 	billy "github.com/go-git/go-billy/v5"
@@ -19,13 +20,126 @@ import (
 // FS implements billy.Filesystem on top of the cache.Manager.
 // go-nfs uses billy.Filesystem; the FUSE layer calls the same methods.
 type FS struct {
-	mgr *cache.Manager
-	ctx context.Context
+	mgr  *cache.Manager
+	ctx  context.Context
+	pool *handlePool
 }
 
 // New creates an FS backed by the given cache.Manager.
 func New(ctx context.Context, mgr *cache.Manager) *FS {
-	return &FS{mgr: mgr, ctx: ctx}
+	fs := &FS{mgr: mgr, ctx: ctx, pool: newHandlePool()}
+	go fs.pool.evictLoop(ctx)
+	return fs
+}
+
+// ---- per-file handle pool --------------------------------------------------
+//
+// go-nfs calls Open → ReadAt(buf, offset) → Close for every NFS READ RPC.
+// Without pooling each call opens a new remote connection (one HTTP range
+// request per 128 KiB block).  The pool lets sequential reads reuse the same
+// open stream: the ReadSeekCloser is returned to the pool on Close() instead
+// of being discarded, and the next Open() for the same path grabs it.
+
+const (
+	poolMaxPerFile = 4              // max idle handles per path
+	poolIdleTTL    = 60 * time.Second
+	poolEvictEvery = 30 * time.Second
+)
+
+type poolEntry struct {
+	rc   io.ReadSeekCloser
+	idle time.Time
+}
+
+type handlePool struct {
+	mu      sync.Mutex
+	entries map[string][]poolEntry
+}
+
+func newHandlePool() *handlePool {
+	return &handlePool{entries: make(map[string][]poolEntry)}
+}
+
+func (p *handlePool) get(path string) io.ReadSeekCloser {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	list := p.entries[path]
+	if len(list) == 0 {
+		return nil
+	}
+	e := list[len(list)-1]
+	p.entries[path] = list[:len(list)-1]
+	return e.rc
+}
+
+func (p *handlePool) put(path string, rc io.ReadSeekCloser) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	list := p.entries[path]
+	if len(list) >= poolMaxPerFile {
+		// Pool full — close the oldest entry and discard.
+		list[0].rc.Close()
+		list = list[1:]
+	}
+	p.entries[path] = append(list, poolEntry{rc: rc, idle: time.Now()})
+}
+
+func (p *handlePool) evictLoop(ctx context.Context) {
+	t := time.NewTicker(poolEvictEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			p.closeAll()
+			return
+		case <-t.C:
+			p.evict()
+		}
+	}
+}
+
+func (p *handlePool) evict() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cutoff := time.Now().Add(-poolIdleTTL)
+	for path, list := range p.entries {
+		kept := list[:0]
+		for _, e := range list {
+			if e.idle.After(cutoff) {
+				kept = append(kept, e)
+			} else {
+				e.rc.Close()
+			}
+		}
+		if len(kept) == 0 {
+			delete(p.entries, path)
+		} else {
+			p.entries[path] = kept
+		}
+	}
+}
+
+func (p *handlePool) closeAll() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, list := range p.entries {
+		for _, e := range list {
+			e.rc.Close()
+		}
+	}
+	p.entries = make(map[string][]poolEntry)
+}
+
+// pooledFile wraps a readFile and returns its ReadSeekCloser to the pool on Close.
+type pooledFile struct {
+	readFile
+	pool *handlePool
+	path string
+}
+
+func (f *pooledFile) Close() error {
+	f.pool.put(f.path, f.rc)
+	return nil
 }
 
 // ---- billy.Filesystem implementation ---------------------------------------
@@ -43,6 +157,22 @@ func (fs *FS) OpenFile(filename string, flag int, perm os.FileMode) (billy.File,
 	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0 {
 		return newWriteFile(fs.ctx, fs.mgr, filename, perm)
 	}
+
+	// Try the pool first — avoids opening a new remote connection for every
+	// NFS READ RPC (go-nfs calls Open → ReadAt → Close per request).
+	if rc := fs.pool.get(filename); rc != nil {
+		info, err := fs.mgr.Stat(fs.ctx, filename)
+		if err != nil {
+			rc.Close()
+			return nil, err
+		}
+		return &pooledFile{
+			readFile: readFile{name: filename, rc: rc, size: info.Size},
+			pool:     fs.pool,
+			path:     filename,
+		}, nil
+	}
+
 	rc, err := fs.mgr.Open(fs.ctx, filename)
 	if err != nil {
 		return nil, err
@@ -52,10 +182,10 @@ func (fs *FS) OpenFile(filename string, flag int, perm os.FileMode) (billy.File,
 		rc.Close()
 		return nil, err
 	}
-	return &readFile{
-		name: filename,
-		rc:   rc,
-		size: info.Size,
+	return &pooledFile{
+		readFile: readFile{name: filename, rc: rc, size: info.Size},
+		pool:     fs.pool,
+		path:     filename,
 	}, nil
 }
 
@@ -189,12 +319,21 @@ type readFile struct {
 
 func (f *readFile) Name() string                               { return f.name }
 func (f *readFile) Read(p []byte) (int, error)                 { return f.rc.Read(p) }
-func (f *readFile) ReadAt(p []byte, off int64) (int, error)    {
-	_, err := f.rc.Seek(off, io.SeekStart)
-	if err != nil {
+func (f *readFile) ReadAt(p []byte, off int64) (int, error) {
+	if _, err := f.rc.Seek(off, io.SeekStart); err != nil {
 		return 0, err
 	}
-	return f.rc.Read(p)
+	// Loop until the buffer is full or the stream ends — a single Read may
+	// return fewer bytes than requested even without error (short read).
+	var total int
+	for total < len(p) {
+		n, err := f.rc.Read(p[total:])
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
 }
 func (f *readFile) Seek(offset int64, whence int) (int64, error) { return f.rc.Seek(offset, whence) }
 func (f *readFile) Close() error                                 { return f.rc.Close() }

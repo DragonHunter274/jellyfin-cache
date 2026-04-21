@@ -241,6 +241,61 @@ func TestRclone_LargeForwardSeek(t *testing.T) {
 	}
 }
 
+// TestRclone_NFSReadPattern simulates exactly what go-nfs onRead does for each
+// NFS READ RPC: Open → Seek(offset) → Read(128KiB) → Close.
+//
+// With lazy open, each iteration issues one range-request starting at offset.
+// Without lazy open it would issue two (offset 0, then reopen at offset).
+func TestRclone_NFSReadPattern(t *testing.T) {
+	const (
+		total  = 2 * 1024 * 1024 // 2 MiB — enough to show the pattern
+		nBlocks = total / blockSize
+	)
+	ctx := context.Background()
+	b := openBackend(t)
+
+	// Reference: single stream.
+	ref := make([]byte, total)
+	{
+		rc, err := b.Open(ctx, testPath)
+		if err != nil {
+			t.Fatalf("Open (ref): %v", err)
+		}
+		if _, err := io.ReadFull(rc, ref); err != nil {
+			t.Fatalf("ReadFull (ref): %v", err)
+		}
+		rc.Close()
+	}
+
+	got := make([]byte, total)
+	start := time.Now()
+	for i := 0; i < nBlocks; i++ {
+		off := int64(i * blockSize)
+		rc, err := b.Open(ctx, testPath)
+		if err != nil {
+			t.Fatalf("block %d Open: %v", i, err)
+		}
+		if _, err := rc.Seek(off, io.SeekStart); err != nil {
+			rc.Close()
+			t.Fatalf("block %d Seek: %v", i, err)
+		}
+		if _, err := io.ReadFull(rc, got[off:off+blockSize]); err != nil {
+			rc.Close()
+			t.Fatalf("block %d Read: %v", i, err)
+		}
+		rc.Close()
+	}
+	elapsed := time.Since(start)
+	t.Logf("NFS pattern: %d open+seek+read+close in %s (%.1f blocks/s, ~%.1f MB/s)",
+		nBlocks, elapsed,
+		float64(nBlocks)/elapsed.Seconds(),
+		float64(total)/elapsed.Seconds()/1024/1024)
+
+	if !bytes.Equal(ref, got) {
+		t.Error("NFS pattern data does not match reference stream")
+	}
+}
+
 // TestRclone_BackwardSeek verifies that seeking backward (always reopens) gives
 // the same data as a fresh read from that position.
 func TestRclone_BackwardSeek(t *testing.T) {
