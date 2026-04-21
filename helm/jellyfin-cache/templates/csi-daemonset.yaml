@@ -19,6 +19,11 @@ spec:
         {{- include "jellyfin-cache.csiSelectorLabels" . | nindent 8 }}
     spec:
       serviceAccountName: {{ include "jellyfin-cache.fullname" . }}-csi
+      # NFS (and 9P) mounts must be performed from the host network namespace;
+      # connections created inside a container netns cannot sustain after
+      # Bidirectional mount propagation to the host, causing EIO.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
         # ── CSI node plugin ───────────────────────────────────────────────
         - name: csi-plugin
