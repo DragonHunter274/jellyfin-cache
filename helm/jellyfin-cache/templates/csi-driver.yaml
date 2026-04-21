@@ -1,0 +1,13 @@
+{{- if .Values.csi.enabled }}
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: {{ .Values.csi.driverName }}
+  labels:
+    {{- include "jellyfin-cache.labels" . | nindent 4 }}
+spec:
+  attachRequired: false
+  podInfoOnMount: false
+  volumeLifecycleModes:
+    - Ephemeral
+{{- end }}

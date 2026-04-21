@@ -1,14 +1,17 @@
 module jellyfin-cache
 
-go 1.23
+go 1.23.0
 
 require (
+	github.com/container-storage-interface/spec v1.12.0
 	github.com/go-git/go-billy/v5 v5.6.1
 	github.com/hanwen/go-fuse/v2 v2.7.2
+	github.com/hugelgupf/p9 v0.3.0
 	github.com/rclone/rclone v1.68.1
 	github.com/spf13/cobra v1.8.1
 	github.com/willscott/go-nfs v0.0.3
 	go.etcd.io/bbolt v1.3.11
+	google.golang.org/grpc v1.64.1
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -123,6 +126,7 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/ncw/swift/v2 v2.0.3 // indirect
+	github.com/nxadm/tail v1.4.11 // indirect
 	github.com/oracle/oci-go-sdk/v65 v65.69.2 // indirect
 	github.com/panjf2000/ants/v2 v2.9.1 // indirect
 	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
@@ -147,6 +151,7 @@ require (
 	github.com/shoenig/go-m1cpu v0.1.6 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/skratchdot/open-golang v0.0.0-20200116055534-eef842397966 // indirect
+	github.com/smartystreets/goconvey v1.8.1 // indirect
 	github.com/sony/gobreaker v0.5.0 // indirect
 	github.com/spacemonkeygo/monkit/v3 v3.0.22 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
@@ -154,6 +159,7 @@ require (
 	github.com/t3rm1n4l/go-mega v0.0.0-20240219080617-d494b6a8ace7 // indirect
 	github.com/tklauser/go-sysconf v0.3.13 // indirect
 	github.com/tklauser/numcpus v0.7.0 // indirect
+	github.com/u-root/uio v0.0.0-20230305220412-3e8cd9d6bf63 // indirect
 	github.com/unknwon/goconfig v1.0.0 // indirect
 	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00 // indirect
 	github.com/xanzy/ssh-agent v0.3.3 // indirect
@@ -167,20 +173,19 @@ require (
 	go.opentelemetry.io/otel v1.24.0 // indirect
 	go.opentelemetry.io/otel/metric v1.24.0 // indirect
 	go.opentelemetry.io/otel/trace v1.24.0 // indirect
-	golang.org/x/crypto v0.31.0 // indirect
+	golang.org/x/crypto v0.36.0 // indirect
 	golang.org/x/exp v0.0.0-20240719175910-8a7402abbf56 // indirect
 	golang.org/x/mod v0.19.0 // indirect
-	golang.org/x/net v0.33.0 // indirect
+	golang.org/x/net v0.38.0 // indirect
 	golang.org/x/oauth2 v0.21.0 // indirect
-	golang.org/x/sync v0.10.0 // indirect
-	golang.org/x/sys v0.28.0 // indirect
-	golang.org/x/term v0.27.0 // indirect
-	golang.org/x/text v0.21.0 // indirect
+	golang.org/x/sync v0.12.0 // indirect
+	golang.org/x/sys v0.31.0 // indirect
+	golang.org/x/term v0.30.0 // indirect
+	golang.org/x/text v0.23.0 // indirect
 	golang.org/x/time v0.5.0 // indirect
 	golang.org/x/tools v0.23.0 // indirect
 	google.golang.org/api v0.188.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240708141625-4ad9e859172b // indirect
-	google.golang.org/grpc v1.64.1 // indirect
 	google.golang.org/protobuf v1.34.2 // indirect
 	gopkg.in/validator.v2 v2.0.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect

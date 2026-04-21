@@ -49,7 +49,13 @@ cache:
   evictInterval: "5m"
 
 # ---------------------------------------------------------------------------
-# Mount — NFS is recommended for Kubernetes (no kernel modules required)
+# Mount — choose one transport for the virtual filesystem
+#
+#   nfs  – NFS v3 over TCP; no kernel module needed on server side; hostPort
+#           required on k3s/clusters where kube-proxy doesn't reach host netns.
+#   9p   – 9P2000.L over TCP; no portmapper/lockd; recommended with the CSI
+#           driver (csi: section below). Requires 9p kernel module on nodes.
+#   fuse – local FUSE mount; requires privileged container.
 # ---------------------------------------------------------------------------
 mount:
   type: nfs
@@ -57,6 +63,8 @@ mount:
   path: /mnt/jellyfin-cache
   # NFS listen address (only used when type=nfs)
   nfsListen: "0.0.0.0:2049"
+  # 9P listen address (only used when type=9p)
+  p9Listen: "0.0.0.0:5640"
   allowOther: false
 
 # Expose the NFS port directly on the node so kubelet can mount it via hostPort.
@@ -64,6 +72,43 @@ mount:
 # the host network namespace (common in k3s).
 nfs:
   hostPort: false
+
+# ---------------------------------------------------------------------------
+# CSI driver — mounts the cache server into pods via Kubernetes-native
+# volume plumbing. No NFS PV/PVC or hostPort required in the pod spec.
+#
+# The CSI driver supports two protocols via volumeAttributes.protocol:
+#   nfs (default) — requires mount.type=nfs on the daemon; NFS kernel module
+#                   is present on virtually all Linux nodes.
+#   9p            — requires mount.type=9p on the daemon; needs the 9p/9pnet/
+#                   9pnet_tcp kernel modules (modprobe 9p 9pnet 9pnet_tcp).
+#
+# Usage in a Jellyfin pod spec:
+#   volumes:
+#   - name: media
+#     csi:
+#       driver: jellyfin-cache.csi.io
+#       volumeAttributes:
+#         server: jellyfin-cache.jellyfin.svc.cluster.local
+#         # protocol: nfs    # optional — nfs is the default
+#         # port: "2049"     # optional — defaults to 2049 (nfs) or 5640 (9p)
+# ---------------------------------------------------------------------------
+csi:
+  enabled: false
+  driverName: jellyfin-cache.csi.io
+  nodeDriverRegistrar:
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar
+    tag: v2.10.1
+  resources:
+    requests:
+      cpu: 10m
+      memory: 20Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 # ---------------------------------------------------------------------------
 # Optional Jellyfin webhook

@@ -55,6 +55,14 @@ created by this chart.
 {{- end }}
 
 {{/*
+Selector labels for the CSI DaemonSet (separate from the cache daemon).
+*/}}
+{{- define "jellyfin-cache.csiSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "jellyfin-cache.name" . }}-csi
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
 Name of the PVC to use.
 */}}
 {{- define "jellyfin-cache.pvcName" -}}

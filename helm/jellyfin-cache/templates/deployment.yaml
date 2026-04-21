@@ -40,12 +40,18 @@ spec:
           {{- end }}
 
           ports:
+            {{- if eq .Values.mount.type "9p" }}
+            - name: p9
+              containerPort: {{ .Values.mount.p9Listen | splitList ":" | last }}
+              protocol: TCP
+            {{- else }}
             - name: nfs
               containerPort: 2049
               protocol: TCP
               {{- if .Values.nfs.hostPort }}
               hostPort: 2049
               {{- end }}
+            {{- end }}
             {{- if .Values.webhook.enabled }}
             - name: webhook
               containerPort: 8089
@@ -74,15 +80,16 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
 
+          {{- $probePort := ternary "p9" "nfs" (eq .Values.mount.type "9p") }}
           readinessProbe:
             tcpSocket:
-              port: nfs
+              port: {{ $probePort }}
             initialDelaySeconds: 5
             periodSeconds: 10
 
           livenessProbe:
             tcpSocket:
-              port: nfs
+              port: {{ $probePort }}
             initialDelaySeconds: 15
             periodSeconds: 30
             failureThreshold: 3

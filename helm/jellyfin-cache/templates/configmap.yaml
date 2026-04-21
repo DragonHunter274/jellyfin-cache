@@ -35,7 +35,7 @@ data:
     mount:
       type: {{ .Values.mount.type | quote }}
       path: {{ .Values.mount.path | quote }}
-      listen: {{ .Values.mount.nfsListen | quote }}
+      listen: {{ if eq .Values.mount.type "9p" }}{{ .Values.mount.p9Listen | quote }}{{ else }}{{ .Values.mount.nfsListen | quote }}{{ end }}
       allow_other: {{ .Values.mount.allowOther }}
 
     webhook:

@@ -185,7 +185,7 @@ type APIConfig struct {
 
 // MountConfig controls how the virtual filesystem is exposed.
 type MountConfig struct {
-	// Type is "fuse" or "nfs".
+	// Type is "fuse", "nfs", or "9p".
 	Type string `yaml:"type"`
 
 	// Path is the local directory for FUSE mounts.
@@ -310,9 +310,9 @@ func (c *Config) Validate() error {
 		}
 	}
 	switch c.Mount.Type {
-	case "fuse", "nfs":
+	case "fuse", "nfs", "9p":
 	default:
-		return fmt.Errorf("mount.type must be 'fuse' or 'nfs', got %q", c.Mount.Type)
+		return fmt.Errorf("mount.type must be 'fuse', 'nfs', or '9p', got %q", c.Mount.Type)
 	}
 	if c.Mount.Type == "fuse" && c.Mount.Path == "" {
 		return fmt.Errorf("mount.path is required for FUSE mounts")

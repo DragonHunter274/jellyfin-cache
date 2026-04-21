@@ -1,0 +1,94 @@
+{{- if .Values.csi.enabled }}
+{{- $pluginDir := printf "/var/lib/kubelet/plugins/%s" .Values.csi.driverName }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "jellyfin-cache.fullname" . }}-csi
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "jellyfin-cache.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "jellyfin-cache.csiSelectorLabels" . | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        {{- include "jellyfin-cache.csiSelectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "jellyfin-cache.fullname" . }}-csi
+      containers:
+        # ── CSI node plugin ───────────────────────────────────────────────
+        - name: csi-plugin
+          image: "{{ .Values.image.repository }}:{{ include "jellyfin-cache.imageTag" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - csi
+            - --node-id=$(NODE_NAME)
+            - --endpoint=unix:///csi/csi.sock
+            - --log-level={{ .Values.log.level }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: Bidirectional
+          resources:
+            {{- toYaml .Values.csi.resources | nindent 12 }}
+
+        # ── node-driver-registrar sidecar ─────────────────────────────────
+        - name: node-driver-registrar
+          image: "{{ .Values.csi.nodeDriverRegistrar.image }}:{{ .Values.csi.nodeDriverRegistrar.tag }}"
+          imagePullPolicy: IfNotPresent
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ $pluginDir }}/csi.sock
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+          resources:
+            requests:
+              cpu: 10m
+              memory: 20Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: {{ $pluginDir }}
+            type: DirectoryOrCreate
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: Directory
+
+      {{- with .Values.csi.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.csi.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.csi.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

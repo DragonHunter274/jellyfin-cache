@@ -10,10 +10,17 @@ spec:
   selector:
     {{- include "jellyfin-cache.selectorLabels" . | nindent 4 }}
   ports:
+    {{- if eq .Values.mount.type "9p" }}
+    - name: p9
+      port: {{ .Values.mount.p9Listen | splitList ":" | last }}
+      targetPort: p9
+      protocol: TCP
+    {{- else }}
     - name: nfs
       port: 2049
       targetPort: nfs
       protocol: TCP
+    {{- end }}
     {{- if .Values.webhook.enabled }}
     - name: webhook
       port: 8089

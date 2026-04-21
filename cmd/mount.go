@@ -115,6 +115,9 @@ func runMount(cmd *cobra.Command, args []string) error {
 	case "nfs":
 		log.Info("serving via NFS", "addr", cfg.Mount.Listen)
 		return mount.ServeNFS(ctx, mgr, cfg.Mount, log)
+	case "9p":
+		log.Info("serving via 9P", "addr", cfg.Mount.Listen)
+		return mount.Serve9P(ctx, mgr, cfg.Mount, log)
 	default:
 		return fmt.Errorf("unknown mount type %q", cfg.Mount.Type)
 	}
