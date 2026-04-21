@@ -65,10 +65,14 @@ func (fs *FS) Stat(filename string) (os.FileInfo, error) {
 		return &fileInfo{name: ".", modTime: time.Now(), isDir: true}, nil
 	}
 	rec, err := fs.mgr.Stat(fs.ctx, filename)
-	if err != nil {
-		return nil, err
+	if err == nil {
+		return infoToFileInfo(rec), nil
 	}
-	return infoToFileInfo(rec), nil
+	// Not a known file — check whether it's a directory on any backend.
+	if _, listErr := fs.mgr.List(fs.ctx, filename); listErr == nil {
+		return &fileInfo{name: path.Base(filename), modTime: time.Now(), isDir: true}, nil
+	}
+	return nil, err
 }
 
 func (fs *FS) Rename(oldpath, newpath string) error {
