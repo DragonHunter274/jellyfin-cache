@@ -61,6 +61,9 @@ func (fs *FS) OpenFile(filename string, flag int, perm os.FileMode) (billy.File,
 
 func (fs *FS) Stat(filename string) (os.FileInfo, error) {
 	filename = clean(filename)
+	if filename == "" {
+		return &fileInfo{name: ".", modTime: time.Now(), isDir: true}, nil
+	}
 	rec, err := fs.mgr.Stat(fs.ctx, filename)
 	if err != nil {
 		return nil, err
