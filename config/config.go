@@ -77,6 +77,11 @@ type CacheConfig struct {
 
 	// Cache eviction check interval.  Default: 5m.
 	EvictInterval Duration `yaml:"evict_interval"`
+
+	// How often the remote is re-scanned to detect new or migrated files.
+	// Set to 0 to disable periodic scanning (only scan at startup).
+	// Default: 5m.
+	ScanInterval Duration `yaml:"scan_interval"`
 }
 
 // RemoteConfig describes one backend source.
@@ -254,6 +259,9 @@ func (c *Config) Defaults() {
 	}
 	if cc.EvictInterval.Duration == 0 {
 		cc.EvictInterval.Duration = 5 * time.Minute
+	}
+	if cc.ScanInterval.Duration == 0 {
+		cc.ScanInterval.Duration = 5 * time.Minute
 	}
 	if cc.MinPlayDuration.Duration == 0 {
 		cc.MinPlayDuration.Duration = 10 * time.Second

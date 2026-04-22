@@ -385,18 +385,39 @@ func (m *Manager) bootstrapPrefetch(ctx context.Context) {
 	}
 }
 
-// walkAndScan recursively lists the remote on startup and registers any files
-// not yet in the DB, queuing them for prefix prefetch.  This ensures the cache
-// proactively warms up even before Jellyfin browses the library.
+// walkAndScan recursively lists all remotes, registers new files, and updates
+// records for files that have migrated between backends.  It runs once at
+// startup and then repeats at cfg.ScanInterval so that moved files are picked
+// up automatically without a daemon restart.
 func (m *Manager) walkAndScan(ctx context.Context) {
 	defer m.wg.Done()
-	m.log.Info("scanning remote for uncached files")
-	queued := 0
-	if err := m.walkDir(ctx, "", &queued); err != nil && ctx.Err() == nil {
-		m.log.Warn("remote scan failed", "err", err)
+
+	doScan := func() {
+		m.log.Info("scanning remotes for new/migrated files")
+		queued := 0
+		if err := m.walkDir(ctx, "", &queued); err != nil && ctx.Err() == nil {
+			m.log.Warn("remote scan failed", "err", err)
+			return
+		}
+		m.log.Info("remote scan complete", "files_queued", queued)
+	}
+
+	doScan()
+
+	interval := m.cfg.ScanInterval.Duration
+	if interval == 0 {
 		return
 	}
-	m.log.Info("remote scan complete", "files_queued", queued)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			doScan()
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (m *Manager) walkDir(ctx context.Context, dir string, queued *int) error {
