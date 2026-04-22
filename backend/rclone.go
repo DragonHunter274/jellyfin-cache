@@ -9,7 +9,6 @@ import (
 	// rclone filesystem abstraction
 	rfs "github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/object"
-	"github.com/rclone/rclone/fs/walk"
 
 	"jellyfin-cache/config"
 )
@@ -45,16 +44,20 @@ func (b *RcloneBackend) Priority() int       { return b.priority }
 func (b *RcloneBackend) Passthrough() bool   { return b.passthrough }
 
 func (b *RcloneBackend) List(ctx context.Context, dir string) ([]Info, error) {
-	var infos []Info
-	err := walk.ListR(ctx, b.fs, dir, true, 1, walk.ListAll, func(entries rfs.DirEntries) error {
-		for _, e := range entries {
-			info := entryToInfo(e)
-			infos = append(infos, info)
-		}
-		return nil
-	})
+	// Use fs.List instead of walk.ListR to avoid rclone logging "ERROR: directory not found"
+	// for every directory that doesn't exist on this backend (common when a second remote is
+	// empty). walk.ListR emits those log lines internally before returning the error; fs.List
+	// does not. The union merges results across backends, so a missing directory here is fine.
+	entries, err := b.fs.List(ctx, dir)
+	if err == rfs.ErrorDirNotFound {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("listing %q on %q: %w", dir, b.name, err)
+	}
+	infos := make([]Info, 0, len(entries))
+	for _, e := range entries {
+		infos = append(infos, entryToInfo(e))
 	}
 	return infos, nil
 }

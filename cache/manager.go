@@ -428,7 +428,26 @@ func (m *Manager) walkDir(ctx context.Context, dir string, queued *int) error {
 			continue
 		}
 		if rec != nil {
-			continue // already known; bootstrapPrefetch handles re-queuing
+			// If the file has migrated to a different backend, update the record so
+			// passthrough detection and prefetch routing stay correct.
+			if rec.RemoteName != "" && rec.RemoteName != entry.BackendName {
+				m.log.Info("scan: file migrated backend",
+					"path", entry.Path,
+					"old", rec.RemoteName,
+					"new", entry.BackendName)
+				rec.RemoteName = entry.BackendName
+				rec.RemotePriority = entry.BackendPriority
+				if err := m.db.Put(rec); err != nil {
+					m.log.Warn("scan: db update failed for migrated file", "path", entry.Path, "err", err)
+				} else if rec.State == StateUncached && !m.passthrough[entry.BackendName] {
+					select {
+					case m.prefetchCh <- entry.Path:
+					default:
+					}
+					*queued++
+				}
+			}
+			continue
 		}
 		rec = &FileRecord{
 			Path:           entry.Path,
