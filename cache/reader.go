@@ -53,6 +53,21 @@ type CacheReader struct {
 
 	// Sliding window of recent seek timestamps for trickplay detection.
 	seekTimes []time.Time
+
+	// Persistent remote reader kept open between consecutive readRemoteAt calls.
+	//
+	// Without this, every NFS READ RPC opens a brand-new remote connection,
+	// fetches a 4 MiB read-ahead buffer, returns 128 KiB to the caller, then
+	// discards the rest and closes.  For a SFTP/HTTPS remote each connection
+	// costs 100–300 ms of RTT, making high-bitrate files completely unplayable
+	// past the cached prefix.
+	//
+	// With the persistent reader, sequential NFS reads drain the same 4 MiB
+	// buffer from memory (≈32 RPCs per network round-trip) and the connection
+	// is only re-opened when the reader seeks to a non-contiguous position.
+	remoteMu  sync.Mutex
+	remoteRC  io.ReadSeekCloser
+	remoteOff int64
 }
 
 func (r *CacheReader) Read(p []byte) (int, error) {
@@ -91,11 +106,18 @@ func (r *CacheReader) Seek(offset int64, whence int) (int64, error) {
 
 func (r *CacheReader) Close() error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.timer != nil {
 		r.timer.Stop()
 		r.timer = nil
 	}
+	r.mu.Unlock()
+
+	r.remoteMu.Lock()
+	if r.remoteRC != nil {
+		r.remoteRC.Close()
+		r.remoteRC = nil
+	}
+	r.remoteMu.Unlock()
 	return nil
 }
 
@@ -227,15 +249,51 @@ func (r *CacheReader) readLocalAt(p []byte, offset int64) (int, error) {
 }
 
 func (r *CacheReader) readRemoteAt(p []byte, offset int64) (int, error) {
-	rc, err := r.manager.union.Open(r.ctx, r.path)
-	if err != nil {
-		return 0, err
-	}
-	defer rc.Close()
-	if offset > 0 {
-		if _, err := rc.Seek(offset, io.SeekStart); err != nil {
+	r.remoteMu.Lock()
+	defer r.remoteMu.Unlock()
+
+	if r.remoteRC == nil {
+		if err := r.openRemoteLocked(offset); err != nil {
 			return 0, err
 		}
+	} else if r.remoteOff != offset {
+		// Non-sequential access: try to seek within the existing connection
+		// (cheap if within the rclone read-ahead buffer) and reopen if not.
+		if _, err := r.remoteRC.Seek(offset, io.SeekStart); err != nil {
+			r.remoteRC.Close()
+			r.remoteRC = nil
+			if err := r.openRemoteLocked(offset); err != nil {
+				return 0, err
+			}
+		} else {
+			r.remoteOff = offset
+		}
 	}
-	return io.ReadFull(rc, p)
+
+	n, err := io.ReadFull(r.remoteRC, p)
+	r.remoteOff += int64(n)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		// Broken stream — discard so the next call reopens cleanly.
+		r.remoteRC.Close()
+		r.remoteRC = nil
+	}
+	return n, err
+}
+
+// openRemoteLocked opens the union at offset and stores the reader in r.remoteRC.
+// Must be called with r.remoteMu held.
+func (r *CacheReader) openRemoteLocked(offset int64) error {
+	rc, err := r.manager.union.Open(r.ctx, r.path)
+	if err != nil {
+		return err
+	}
+	if offset > 0 {
+		if _, err := rc.Seek(offset, io.SeekStart); err != nil {
+			rc.Close()
+			return err
+		}
+	}
+	r.remoteRC = rc
+	r.remoteOff = offset
+	return nil
 }
