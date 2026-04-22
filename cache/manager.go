@@ -777,6 +777,18 @@ func parseSize(s string) (int64, error) {
 	return n, nil
 }
 
+// ---- NFS handle persistence (delegated to DB) ------------------------------
+
+func (m *Manager) LoadNFSHandles() ([][16]byte, [][]string, error) {
+	return m.db.LoadNFSHandles()
+}
+func (m *Manager) SaveNFSHandle(id [16]byte, path []string) error {
+	return m.db.SaveNFSHandle(id, path)
+}
+func (m *Manager) DeleteNFSHandle(id [16]byte) error {
+	return m.db.DeleteNFSHandle(id)
+}
+
 // ReadThrough opens the remote directly, bypassing the cache.
 // Used as a fallback when the cache is unavailable.
 func (m *Manager) ReadThrough(ctx context.Context, path string) (io.ReadSeekCloser, error) {

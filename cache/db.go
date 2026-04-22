@@ -9,7 +9,8 @@ import (
 )
 
 var (
-	bucketFiles = []byte("files")
+	bucketFiles      = []byte("files")
+	bucketNFSHandles = []byte("nfs_handles")
 )
 
 // FileRecord is the persistent metadata stored in BoltDB for every tracked
@@ -41,8 +42,12 @@ func OpenDB(path string) (*DB, error) {
 		return nil, fmt.Errorf("opening metadata db %q: %w", path, err)
 	}
 	if err := db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(bucketFiles)
-		return err
+		for _, name := range [][]byte{bucketFiles, bucketNFSHandles} {
+			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
+				return err
+			}
+		}
+		return nil
 	}); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initialising metadata db: %w", err)
@@ -157,6 +162,56 @@ func (d *DB) TouchAccess(path string) error {
 			return err
 		}
 		return b.Put([]byte(path), data)
+	})
+}
+
+// ---- NFS handle persistence ------------------------------------------------
+//
+// NFS file handles are opaque 16-byte IDs that the kernel NFS client caches
+// and reuses across mounts.  If the server restarts with a fresh in-memory
+// map (as the go-nfs CachingHandler uses) every handle the client holds
+// becomes NFS3ERR_STALE, requiring a restart of every pod that has the volume
+// mounted.  Storing the handle→path mapping here means the same IDs are served
+// after a daemon restart, so kernel clients reconnect seamlessly.
+
+// LoadNFSHandles returns all persisted handle→path mappings.
+func (d *DB) LoadNFSHandles() ([][16]byte, [][]string, error) {
+	var ids [][16]byte
+	var paths [][]string
+	err := d.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketNFSHandles).ForEach(func(k, v []byte) error {
+			if len(k) != 16 {
+				return nil // skip any corrupt entry
+			}
+			var path []string
+			if err := json.Unmarshal(v, &path); err != nil {
+				return nil
+			}
+			var id [16]byte
+			copy(id[:], k)
+			ids = append(ids, id)
+			paths = append(paths, path)
+			return nil
+		})
+	})
+	return ids, paths, err
+}
+
+// SaveNFSHandle persists a handle→path mapping.
+func (d *DB) SaveNFSHandle(id [16]byte, path []string) error {
+	v, err := json.Marshal(path)
+	if err != nil {
+		return err
+	}
+	return d.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketNFSHandles).Put(id[:], v)
+	})
+}
+
+// DeleteNFSHandle removes a persisted handle (called when a file is deleted).
+func (d *DB) DeleteNFSHandle(id [16]byte) error {
+	return d.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketNFSHandles).Delete(id[:])
 	})
 }
 
