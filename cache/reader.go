@@ -176,8 +176,19 @@ func (r *CacheReader) readAt(p []byte, offset int64) (int, error) {
 	if rec.CachedBytes >= end {
 		return r.readLocalAt(p, offset)
 	}
+
+	// This read requires data beyond the local cache boundary.  Trigger a full
+	// background download immediately rather than waiting for the timer.
+	//
+	// The timer-based path (onTimerFired) only fires after MinPlayDuration, but
+	// for high-bitrate files the cached prefix is exhausted in seconds: the
+	// client stalls waiting on the remote and may close the handle before the
+	// timer fires, which stops the timer via Close() and leaves the file
+	// permanently uncached.
+	r.maybeDownloadOnCacheMiss()
+
 	if offset < rec.CachedBytes {
-		// Split: cached prefix + remote tail.
+		// Split: serve cached prefix from disk, uncached tail from remote.
 		cached := rec.CachedBytes - offset
 		n1, err := r.readLocalAt(p[:cached], offset)
 		if err != nil {
@@ -187,6 +198,23 @@ func (r *CacheReader) readAt(p []byte, offset int64) (int, error) {
 		return n1 + n2, err
 	}
 	return r.readRemoteAt(p, offset)
+}
+
+// maybeDownloadOnCacheMiss triggers a full background download the first time
+// a read requires data past the cached boundary.  It is the primary trigger
+// for high-bitrate content where the timer-based path may never fire.
+// Safe to call multiple times; only fires once per handle.
+func (r *CacheReader) maybeDownloadOnCacheMiss() {
+	r.mu.Lock()
+	trigger := !r.triggered && !r.isTrickplay &&
+		r.cumulativeRead >= r.manager.cfg.PlaybackTriggerBytes
+	if trigger {
+		r.triggered = true
+	}
+	r.mu.Unlock()
+	if trigger {
+		go r.manager.TriggerFullDownload(r.path)
+	}
 }
 
 func (r *CacheReader) readLocalAt(p []byte, offset int64) (int, error) {
