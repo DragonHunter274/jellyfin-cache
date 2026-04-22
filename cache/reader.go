@@ -201,8 +201,19 @@ func (r *CacheReader) readAt(p []byte, offset int64) (int, error) {
 		return r.readRemoteAt(p, offset)
 	}
 
+	// During an active download the DB's CachedBytes is frozen at the prefix
+	// size (UpdateState is called with -1 to leave it unchanged).  Consult the
+	// actual on-disk size so that bytes already written by the download worker
+	// are served locally instead of fetching them from the remote again.
+	cachedBytes := rec.CachedBytes
+	if rec.State == StateDownloading {
+		if live := r.manager.store.Size(r.path); live > cachedBytes {
+			cachedBytes = live
+		}
+	}
+
 	end := offset + int64(len(p))
-	if rec.CachedBytes >= end {
+	if cachedBytes >= end {
 		return r.readLocalAt(p, offset)
 	}
 
@@ -216,14 +227,14 @@ func (r *CacheReader) readAt(p []byte, offset int64) (int, error) {
 	// permanently uncached.
 	r.maybeDownloadOnCacheMiss()
 
-	if offset < rec.CachedBytes {
-		// Split: serve cached prefix from disk, uncached tail from remote.
-		cached := rec.CachedBytes - offset
+	if offset < cachedBytes {
+		// Split: serve the already-cached portion from disk, the rest from remote.
+		cached := cachedBytes - offset
 		n1, err := r.readLocalAt(p[:cached], offset)
 		if err != nil {
 			return n1, err
 		}
-		n2, err := r.readRemoteAt(p[cached:], rec.CachedBytes)
+		n2, err := r.readRemoteAt(p[cached:], cachedBytes)
 		return n1 + n2, err
 	}
 	return r.readRemoteAt(p, offset)
