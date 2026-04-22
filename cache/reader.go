@@ -84,6 +84,7 @@ func (r *CacheReader) Seek(offset int64, whence int) (int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	prev := r.offset
 	var abs int64
 	switch whence {
 	case io.SeekStart:
@@ -98,7 +99,13 @@ func (r *CacheReader) Seek(offset int64, whence int) (int64, error) {
 	}
 	r.offset = abs
 
-	if !r.triggered && !r.isTrickplay {
+	// Only count seeks that actually move the position.  The NFS layer calls
+	// ReadAt(off, n) which issues Seek(off) before every read; for sequential
+	// playback those seeks always land exactly on r.offset (where the last Read
+	// left off), so abs == prev.  Counting them makes trickplay fire immediately
+	// on any sequential stream.  True trickplay and user scrubbing both jump to
+	// non-contiguous positions (abs != prev).
+	if !r.triggered && !r.isTrickplay && abs != prev {
 		r.recordSeek()
 	}
 	return abs, nil
