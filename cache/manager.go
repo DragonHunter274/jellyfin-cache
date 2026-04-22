@@ -193,10 +193,11 @@ func (m *Manager) Open(ctx context.Context, path string) (io.ReadSeekCloser, err
 	_ = m.db.TouchAccess(path)
 
 	return &CacheReader{
-		ctx:     ctx,
-		path:    path,
-		size:    rec.Size,
-		manager: m,
+		ctx:          ctx,
+		path:         path,
+		size:         rec.Size,
+		manager:      m,
+		earlyTrigger: rec.State == StatePrefix || rec.State == StateDownloading,
 	}, nil
 }
 

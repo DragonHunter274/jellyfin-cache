@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"io"
+	"os"
 	"sync"
 	"time"
 )
@@ -12,27 +13,33 @@ import (
 //
 // # Playback detection
 //
-// A full background download is triggered when ALL of these are true:
+// A full background download is triggered when either of these paths fires:
 //
-//  1. Bytes threshold: cumulative bytes read through this handle ≥
-//     cfg.PlaybackTriggerBytes.  Filters tiny metadata probes.
+//  1. Sequential-read fast path (earlyTrigger): for files that are already in
+//     StatePrefix or StateDownloading the download is triggered as soon as the
+//     read pattern is confirmed sequential (no non-contiguous seeks) AND bytes
+//     ≥ cfg.PlaybackTriggerBytes.  Sequential reads with no seeks reach the
+//     threshold in ~1 s of real playback, giving the background download a
+//     multi-second head start before the cached prefix is exhausted.
 //
-//  2. Duration threshold: the handle has been open and reading for at least
-//     cfg.MinPlayDuration.  Filters Jellyfin library scans (ffprobe opens
-//     every file for a few seconds then closes).
+//  2. Duration path: the handle has been open and reading for at least
+//     cfg.MinPlayDuration (default 10 s) AND bytes ≥ cfg.PlaybackTriggerBytes.
+//     This is the catch-all for files not yet prefetched and for non-sequential
+//     access patterns that don't qualify for the fast path.  It also filters
+//     Jellyfin library scans: ffprobe opens every file briefly (1–3 s) and
+//     closes it before the timer fires.
 //
-//  3. Not classified as trickplay (see below).
+//  3. Cache-miss path: if a read lands beyond the cached boundary (prefix
+//     exhausted before the timer fires) the download is triggered immediately
+//     as long as the bytes threshold is already met.
 //
 // # Trickplay suppression
 //
-// Jellyfin's trickplay generator (preview thumbnail strips) works by having
-// ffmpeg seek to evenly-spaced positions throughout the entire file in rapid
-// succession — typically one seek per second or faster.  This would otherwise
-// trigger full downloads of files that nobody is actually watching.
-//
-// If cfg.TrickplaySeekThreshold seeks are observed within
-// cfg.TrickplaySeekWindow the handle is permanently marked as trickplay: the
-// download timer is cancelled and no future trigger will fire on this handle.
+// Jellyfin's trickplay generator seeks to evenly-spaced positions throughout
+// the entire file in rapid succession (~1 seek/s).  If cfg.TrickplaySeekThreshold
+// seeks are observed within cfg.TrickplaySeekWindow the handle is permanently
+// marked as trickplay: the download timer is cancelled and the earlyTrigger
+// fast path is suppressed.
 //
 // New uploads and webhook-triggered downloads are unaffected by this logic.
 type CacheReader struct {
@@ -40,6 +47,12 @@ type CacheReader struct {
 	path    string
 	size    int64
 	manager *Manager
+
+	// earlyTrigger enables the sequential-read fast path (path 1 above).
+	// Set to true when the file is already in StatePrefix or StateDownloading,
+	// i.e. it has been accessed before and is likely to be played rather than
+	// just probed for metadata.
+	earlyTrigger bool
 
 	mu             sync.Mutex
 	offset         int64
@@ -53,6 +66,15 @@ type CacheReader struct {
 
 	// Sliding window of recent seek timestamps for trickplay detection.
 	seekTimes []time.Time
+
+	// Persistent local cache file kept open between consecutive readLocalAt calls.
+	//
+	// Opening the cache file on every NFS READ RPC (open + pread + close per
+	// 128 KiB block) adds three syscalls per RPC.  On PVC-backed storage with
+	// any per-operation latency this can dominate read throughput.  Keeping one
+	// fd open for the lifetime of the CacheReader reduces this to one pread.
+	localMu sync.Mutex
+	localF  *os.File
 
 	// Persistent remote reader kept open between consecutive readRemoteAt calls.
 	//
@@ -119,6 +141,13 @@ func (r *CacheReader) Close() error {
 	}
 	r.mu.Unlock()
 
+	r.localMu.Lock()
+	if r.localF != nil {
+		r.localF.Close()
+		r.localF = nil
+	}
+	r.localMu.Unlock()
+
 	r.remoteMu.Lock()
 	if r.remoteRC != nil {
 		r.remoteRC.Close()
@@ -130,17 +159,38 @@ func (r *CacheReader) Close() error {
 
 // ---- timer management ------------------------------------------------------
 
-// maybeArmTimer starts the playback-detection timer on the first read.
-// Must be called with r.mu held.
+// maybeArmTimer is called after every read (with r.mu held).  It fires the
+// download trigger immediately for confirmed sequential readers (fast path) or
+// arms the MinPlayDuration timer as a fallback.
 func (r *CacheReader) maybeArmTimer() {
-	if r.triggered || r.isTrickplay || r.timer != nil {
+	if r.triggered || r.isTrickplay {
 		return
 	}
 	if r.firstReadAt.IsZero() {
 		r.firstReadAt = time.Now()
 	}
-	d := r.manager.cfg.MinPlayDuration.Duration
-	r.timer = time.AfterFunc(d, r.onTimerFired)
+
+	// Fast path: for files already in StatePrefix or StateDownloading, trigger
+	// as soon as the bytes threshold is met AND no non-contiguous seeks have
+	// been recorded.  Sequential NFS reads never produce non-contiguous seeks
+	// (the Seek call in ReadAt always lands exactly at r.offset), so
+	// len(r.seekTimes)==0 reliably distinguishes sequential playback from the
+	// random-access patterns used by ffprobe metadata scans.
+	if r.earlyTrigger && len(r.seekTimes) == 0 &&
+		r.cumulativeRead >= r.manager.cfg.PlaybackTriggerBytes {
+		if r.timer != nil {
+			r.timer.Stop()
+			r.timer = nil
+		}
+		r.triggered = true
+		go r.manager.TriggerFullDownload(r.path)
+		return
+	}
+
+	if r.timer != nil {
+		return
+	}
+	r.timer = time.AfterFunc(r.manager.cfg.MinPlayDuration.Duration, r.onTimerFired)
 }
 
 // onTimerFired is called by time.AfterFunc after MinPlayDuration elapses.
@@ -225,6 +275,13 @@ func (r *CacheReader) readAt(p []byte, offset int64) (int, error) {
 	// client stalls waiting on the remote and may close the handle before the
 	// timer fires, which stops the timer via Close() and leaves the file
 	// permanently uncached.
+	r.manager.log.Debug("cache miss: read past cached boundary",
+		"path", r.path,
+		"offset", offset,
+		"cached_bytes", cachedBytes,
+		"file_size", r.size,
+		"state", rec.State,
+	)
 	r.maybeDownloadOnCacheMiss()
 
 	if offset < cachedBytes {
@@ -258,12 +315,23 @@ func (r *CacheReader) maybeDownloadOnCacheMiss() {
 }
 
 func (r *CacheReader) readLocalAt(p []byte, offset int64) (int, error) {
-	f, err := r.manager.store.OpenRead(r.path)
-	if err != nil {
-		return r.readRemoteAt(p, offset)
+	r.localMu.Lock()
+	if r.localF == nil {
+		f, err := r.manager.store.OpenRead(r.path)
+		if err != nil {
+			r.localMu.Unlock()
+			return r.readRemoteAt(p, offset)
+		}
+		r.localF = f
 	}
-	defer f.Close()
-	return f.ReadAt(p, offset)
+	n, err := r.localF.ReadAt(p, offset)
+	if err != nil && err != io.EOF {
+		// Invalidate on unexpected errors so the next call retries open.
+		r.localF.Close()
+		r.localF = nil
+	}
+	r.localMu.Unlock()
+	return n, err
 }
 
 func (r *CacheReader) readRemoteAt(p []byte, offset int64) (int, error) {
@@ -301,6 +369,18 @@ func (r *CacheReader) readRemoteAt(p []byte, offset int64) (int, error) {
 // openRemoteLocked opens the union at offset and stores the reader in r.remoteRC.
 // Must be called with r.remoteMu held.
 func (r *CacheReader) openRemoteLocked(offset int64) error {
+	r.manager.log.Info("remote fallback: opening remote connection",
+		"path", r.path,
+		"offset", offset,
+		"file_size", r.size,
+		"pct", func() float64 {
+			if r.size <= 0 {
+				return 0
+			}
+			return float64(offset) / float64(r.size) * 100
+		}(),
+	)
+
 	rc, err := r.manager.union.Open(r.ctx, r.path)
 	if err != nil {
 		return err
