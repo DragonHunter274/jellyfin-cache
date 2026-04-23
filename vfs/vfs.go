@@ -194,15 +194,16 @@ func (fs *FS) Stat(filename string) (os.FileInfo, error) {
 	if filename == "" {
 		return &fileInfo{name: ".", modTime: time.Now(), isDir: true}, nil
 	}
+	// Check knownDirs first: backend.Stat answers "is this a dir?" by listing
+	// its contents, so we must avoid manager.Stat entirely for known directories.
+	if fs.mgr.IsKnownDir(filename) {
+		return &fileInfo{name: path.Base(filename), modTime: time.Now(), isDir: true}, nil
+	}
 	rec, err := fs.mgr.Stat(fs.ctx, filename)
 	if err == nil {
 		return infoToFileInfo(rec), nil
 	}
-	// Fast path: directory confirmed from a prior listing — no remote call needed.
-	if fs.mgr.IsKnownDir(filename) {
-		return &fileInfo{name: path.Base(filename), modTime: time.Now(), isDir: true}, nil
-	}
-	// Slow path: not a known file or directory — ask the remote.
+	// Not a known file — check whether it is a directory (populates knownDirs).
 	if _, listErr := fs.mgr.List(fs.ctx, filename); listErr == nil {
 		return &fileInfo{name: path.Base(filename), modTime: time.Now(), isDir: true}, nil
 	}

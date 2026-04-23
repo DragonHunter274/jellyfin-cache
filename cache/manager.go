@@ -149,7 +149,15 @@ func (m *Manager) Close() error {
 
 // Stat returns metadata for path, preferring cached info from the DB.
 // If not yet tracked, it fetches from the union and creates a DB record.
+// Returns an error (without a remote call) for paths confirmed to be
+// directories by any prior listing.
 func (m *Manager) Stat(ctx context.Context, path string) (*FileRecord, error) {
+	// Fast path: already confirmed as a directory by a prior listing.
+	// backend.Stat answers "is this a directory?" by listing its contents,
+	// so we must short-circuit before reaching union.Stat.
+	if m.IsKnownDir(path) {
+		return nil, fmt.Errorf("%q is a directory", path)
+	}
 	rec, err := m.db.Get(path)
 	if err != nil {
 		return nil, err
@@ -170,6 +178,13 @@ func (m *Manager) Stat(ctx context.Context, path string) (*FileRecord, error) {
 	info, b, err := m.union.Stat(ctx, path)
 	if err != nil {
 		return nil, err
+	}
+	// backend.Stat confirms directories by listing them; don't store a FileRecord.
+	if info.IsDir {
+		m.dirMu.Lock()
+		m.knownDirs[path] = true
+		m.dirMu.Unlock()
+		return nil, fmt.Errorf("%q is a directory", path)
 	}
 	rec = &FileRecord{
 		Path:           path,
