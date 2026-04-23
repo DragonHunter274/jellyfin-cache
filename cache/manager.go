@@ -25,9 +25,10 @@ type Manager struct {
 	log         *slog.Logger
 	passthrough map[string]bool // backend name → passthrough flag
 
-	// In-memory directory listing cache.
-	dirMu    sync.RWMutex
-	dirCache map[string]dirCacheEntry
+	// In-memory directory listing cache (stale-while-revalidate).
+	dirMu         sync.RWMutex
+	dirCache      map[string]dirCacheEntry
+	dirRefreshing map[string]bool // dirs with a background refresh in flight
 
 	// Per-file download locks: prevents concurrent full downloads of the same file.
 	dlMu    sync.Mutex
@@ -98,7 +99,8 @@ func NewManager(cfg config.CacheConfig, u *union.Union, logger *slog.Logger) (*M
 		union:       u,
 		log:         logger,
 		passthrough: pt,
-		dirCache:    make(map[string]dirCacheEntry),
+		dirCache:      make(map[string]dirCacheEntry),
+		dirRefreshing: make(map[string]bool),
 		dlLocks:     make(map[string]*downloadLock),
 		prefetchCh:  make(chan string, 1024),
 		downloadCh:  make(chan downloadJob, 256),
@@ -840,16 +842,31 @@ func (m *Manager) ReadThrough(ctx context.Context, path string) (io.ReadSeekClos
 	return m.union.Open(ctx, path)
 }
 
-// List returns the merged directory listing (delegated to union).
+// List returns the merged directory listing.
+//
+// Stale-while-revalidate: if a cached entry exists but has expired, it is
+// returned immediately and a background goroutine refreshes the cache, so
+// callers never block after the first warm-up.
 func (m *Manager) List(ctx context.Context, dir string) ([]backend.Info, error) {
 	if ttl := m.cfg.DirCacheTTL.Duration; ttl > 0 {
 		m.dirMu.RLock()
 		entry, ok := m.dirCache[dir]
 		m.dirMu.RUnlock()
-		if ok && time.Now().Before(entry.expires) {
+		if ok {
+			if time.Now().Before(entry.expires) {
+				return entry.infos, nil // fresh
+			}
+			// Stale: serve immediately, refresh in background.
+			m.dirMu.Lock()
+			if !m.dirRefreshing[dir] {
+				m.dirRefreshing[dir] = true
+				go m.refreshDirCache(dir)
+			}
+			m.dirMu.Unlock()
 			return entry.infos, nil
 		}
 	}
+	// Cache miss: fetch synchronously.
 	infos, err := m.union.List(ctx, dir)
 	if err != nil {
 		return nil, err
@@ -860,6 +877,19 @@ func (m *Manager) List(ctx context.Context, dir string) ([]backend.Info, error) 
 		m.dirMu.Unlock()
 	}
 	return infos, nil
+}
+
+func (m *Manager) refreshDirCache(dir string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	infos, err := m.union.List(ctx, dir)
+	m.dirMu.Lock()
+	defer m.dirMu.Unlock()
+	delete(m.dirRefreshing, dir)
+	if err != nil {
+		return
+	}
+	m.dirCache[dir] = dirCacheEntry{infos: infos, expires: time.Now().Add(m.cfg.DirCacheTTL.Duration)}
 }
 
 func (m *Manager) invalidateDirCache(path string) {
