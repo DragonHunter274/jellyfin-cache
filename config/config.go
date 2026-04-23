@@ -86,6 +86,11 @@ type CacheConfig struct {
 	// How long directory listings are cached in memory before re-fetching from
 	// the remote backends.  Set to 0 to disable.  Default: 30s.
 	DirCacheTTL Duration `yaml:"dir_cache_ttl"`
+
+	// Number of concurrent remote directory listings allowed at once, used
+	// both by the background scan and by eager subdirectory pre-warming.
+	// Default: 8.
+	ScanWorkers int `yaml:"scan_workers"`
 }
 
 // RemoteConfig describes one backend source.
@@ -277,7 +282,10 @@ func (c *Config) Defaults() {
 		cc.TrickplaySeekWindow.Duration = 10 * time.Second
 	}
 	if cc.DirCacheTTL.Duration == 0 {
-		cc.DirCacheTTL.Duration = 30 * time.Second
+		cc.DirCacheTTL.Duration = 5 * time.Minute
+	}
+	if cc.ScanWorkers == 0 {
+		cc.ScanWorkers = 8
 	}
 
 	mc := &c.Mount

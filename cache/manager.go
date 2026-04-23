@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"jellyfin-cache/backend"
@@ -28,8 +29,11 @@ type Manager struct {
 	// In-memory directory listing cache (stale-while-revalidate).
 	dirMu         sync.RWMutex
 	dirCache      map[string]dirCacheEntry
-	dirRefreshing map[string]bool   // dirs with a background refresh in flight
-	knownDirs     map[string]bool   // paths confirmed to be directories (never expires)
+	dirRefreshing map[string]bool // dirs with a background refresh in flight
+	knownDirs     map[string]bool // paths confirmed to be directories (never expires)
+
+	// Semaphore bounding concurrent remote directory listings (scan + eager warm).
+	scanSem chan struct{}
 
 	// Per-file download locks: prevents concurrent full downloads of the same file.
 	dlMu    sync.Mutex
@@ -103,6 +107,7 @@ func NewManager(cfg config.CacheConfig, u *union.Union, logger *slog.Logger) (*M
 		dirCache:      make(map[string]dirCacheEntry),
 		dirRefreshing: make(map[string]bool),
 		knownDirs:     make(map[string]bool),
+		scanSem:       make(chan struct{}, cfg.ScanWorkers),
 		dlLocks:     make(map[string]*downloadLock),
 		prefetchCh:  make(chan string, 1024),
 		downloadCh:  make(chan downloadJob, 256),
@@ -434,12 +439,12 @@ func (m *Manager) walkAndScan(ctx context.Context) {
 
 	doScan := func() {
 		m.log.Info("scanning remotes for new/migrated files")
-		queued := 0
+		var queued int64
 		if err := m.walkDir(ctx, "", &queued); err != nil && ctx.Err() == nil {
 			m.log.Warn("remote scan failed", "err", err)
 			return
 		}
-		m.log.Info("remote scan complete", "files_queued", queued)
+		m.log.Info("remote scan complete", "files_queued", atomic.LoadInt64(&queued))
 	}
 
 	doScan()
@@ -460,7 +465,7 @@ func (m *Manager) walkAndScan(ctx context.Context) {
 	}
 }
 
-func (m *Manager) walkDir(ctx context.Context, dir string, queued *int) error {
+func (m *Manager) walkDir(ctx context.Context, dir string, queued *int64) error {
 	entries, err := m.union.ListTagged(ctx, dir)
 	if err != nil {
 		if dir == "" {
@@ -479,15 +484,30 @@ func (m *Manager) walkDir(ctx context.Context, dir string, queued *int) error {
 		m.storeDirCacheLocked(dir, infos)
 		m.dirMu.Unlock()
 	}
+	var subWg sync.WaitGroup
 	for _, entry := range entries {
 		select {
 		case <-ctx.Done():
+			subWg.Wait()
 			return ctx.Err()
 		default:
 		}
 		if entry.IsDir {
-			if err := m.walkDir(ctx, entry.Path, queued); err != nil {
-				m.log.Warn("scan: failed listing dir", "path", entry.Path, "err", err)
+			subdir := entry.Path
+			select {
+			case m.scanSem <- struct{}{}: // slot free: scan in parallel
+				subWg.Add(1)
+				go func() {
+					defer subWg.Done()
+					defer func() { <-m.scanSem }()
+					if err := m.walkDir(ctx, subdir, queued); err != nil && ctx.Err() == nil {
+						m.log.Warn("scan: failed listing dir", "path", subdir, "err", err)
+					}
+				}()
+			default: // semaphore full: scan inline
+				if err := m.walkDir(ctx, subdir, queued); err != nil && ctx.Err() == nil {
+					m.log.Warn("scan: failed listing dir", "path", subdir, "err", err)
+				}
 			}
 			continue
 		}
@@ -514,7 +534,7 @@ func (m *Manager) walkDir(ctx context.Context, dir string, queued *int) error {
 					case m.prefetchCh <- entry.Path:
 					default:
 					}
-					*queued++
+					atomic.AddInt64(queued, 1)
 				}
 			}
 			continue
@@ -537,8 +557,9 @@ func (m *Manager) walkDir(ctx context.Context, dir string, queued *int) error {
 		case m.prefetchCh <- entry.Path:
 		default:
 		}
-		*queued++
+		atomic.AddInt64(queued, 1)
 	}
+	subWg.Wait()
 	return nil
 }
 
@@ -877,6 +898,12 @@ func (m *Manager) List(ctx context.Context, dir string) ([]backend.Info, error) 
 		m.dirMu.Lock()
 		m.storeDirCacheLocked(dir, infos)
 		m.dirMu.Unlock()
+		// Eagerly warm uncached subdirectories so the next descent is fast.
+		for _, info := range infos {
+			if info.IsDir {
+				m.scheduleSubdirWarm(info.Path)
+			}
+		}
 	}
 	return infos, nil
 }
@@ -892,6 +919,32 @@ func (m *Manager) refreshDirCache(dir string) {
 		return
 	}
 	m.storeDirCacheLocked(dir, infos)
+}
+
+// scheduleSubdirWarm kicks off a background listing of dir if it is not
+// already cached or being refreshed, bounded by scanSem.
+func (m *Manager) scheduleSubdirWarm(dir string) {
+	m.dirMu.Lock()
+	_, inCache := m.dirCache[dir]
+	refreshing := m.dirRefreshing[dir]
+	if inCache || refreshing {
+		m.dirMu.Unlock()
+		return
+	}
+	m.dirRefreshing[dir] = true
+	m.dirMu.Unlock()
+
+	select {
+	case m.scanSem <- struct{}{}: // slot free: warm in background
+		go func() {
+			defer func() { <-m.scanSem }()
+			m.refreshDirCache(dir)
+		}()
+	default: // semaphore full: let it warm on first access
+		m.dirMu.Lock()
+		delete(m.dirRefreshing, dir)
+		m.dirMu.Unlock()
+	}
 }
 
 // storeDirCacheLocked stores infos under dir and marks all sub-directory
