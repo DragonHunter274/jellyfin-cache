@@ -82,6 +82,10 @@ type CacheConfig struct {
 	// Set to 0 to disable periodic scanning (only scan at startup).
 	// Default: 5m.
 	ScanInterval Duration `yaml:"scan_interval"`
+
+	// How long directory listings are cached in memory before re-fetching from
+	// the remote backends.  Set to 0 to disable.  Default: 30s.
+	DirCacheTTL Duration `yaml:"dir_cache_ttl"`
 }
 
 // RemoteConfig describes one backend source.
@@ -271,6 +275,9 @@ func (c *Config) Defaults() {
 	}
 	if cc.TrickplaySeekWindow.Duration == 0 {
 		cc.TrickplaySeekWindow.Duration = 10 * time.Second
+	}
+	if cc.DirCacheTTL.Duration == 0 {
+		cc.DirCacheTTL.Duration = 30 * time.Second
 	}
 
 	mc := &c.Mount

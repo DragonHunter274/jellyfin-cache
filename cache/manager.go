@@ -25,6 +25,10 @@ type Manager struct {
 	log         *slog.Logger
 	passthrough map[string]bool // backend name → passthrough flag
 
+	// In-memory directory listing cache.
+	dirMu    sync.RWMutex
+	dirCache map[string]dirCacheEntry
+
 	// Per-file download locks: prevents concurrent full downloads of the same file.
 	dlMu    sync.Mutex
 	dlLocks map[string]*downloadLock
@@ -39,6 +43,11 @@ type Manager struct {
 	// Stop all background workers.
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+}
+
+type dirCacheEntry struct {
+	infos   []backend.Info
+	expires time.Time
 }
 
 type downloadLock struct {
@@ -89,6 +98,7 @@ func NewManager(cfg config.CacheConfig, u *union.Union, logger *slog.Logger) (*M
 		union:       u,
 		log:         logger,
 		passthrough: pt,
+		dirCache:    make(map[string]dirCacheEntry),
 		dlLocks:     make(map[string]*downloadLock),
 		prefetchCh:  make(chan string, 1024),
 		downloadCh:  make(chan downloadJob, 256),
@@ -455,6 +465,15 @@ func (m *Manager) walkDir(ctx context.Context, dir string, queued *int) error {
 			m.log.Warn("remote scan: cannot list directory", "dir", dir, "err", err)
 		}
 		return nil // don't abort the whole scan for one failed directory
+	}
+	if ttl := m.cfg.DirCacheTTL.Duration; ttl > 0 {
+		infos := make([]backend.Info, len(entries))
+		for i, e := range entries {
+			infos[i] = e.Info
+		}
+		m.dirMu.Lock()
+		m.dirCache[dir] = dirCacheEntry{infos: infos, expires: time.Now().Add(ttl)}
+		m.dirMu.Unlock()
 	}
 	for _, entry := range entries {
 		select {
@@ -823,12 +842,43 @@ func (m *Manager) ReadThrough(ctx context.Context, path string) (io.ReadSeekClos
 
 // List returns the merged directory listing (delegated to union).
 func (m *Manager) List(ctx context.Context, dir string) ([]backend.Info, error) {
-	return m.union.List(ctx, dir)
+	if ttl := m.cfg.DirCacheTTL.Duration; ttl > 0 {
+		m.dirMu.RLock()
+		entry, ok := m.dirCache[dir]
+		m.dirMu.RUnlock()
+		if ok && time.Now().Before(entry.expires) {
+			return entry.infos, nil
+		}
+	}
+	infos, err := m.union.List(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	if ttl := m.cfg.DirCacheTTL.Duration; ttl > 0 {
+		m.dirMu.Lock()
+		m.dirCache[dir] = dirCacheEntry{infos: infos, expires: time.Now().Add(ttl)}
+		m.dirMu.Unlock()
+	}
+	return infos, nil
+}
+
+func (m *Manager) invalidateDirCache(path string) {
+	dir := filepath.Dir(path)
+	if dir == "." {
+		dir = ""
+	}
+	m.dirMu.Lock()
+	delete(m.dirCache, dir)
+	m.dirMu.Unlock()
 }
 
 // Mkdir creates a directory on the primary writable backend.
 func (m *Manager) Mkdir(ctx context.Context, path string) error {
-	return m.union.Mkdir(ctx, path)
+	err := m.union.Mkdir(ctx, path)
+	if err == nil {
+		m.invalidateDirCache(path)
+	}
+	return err
 }
 
 // Put writes a file through to the union and registers it as an upload.
@@ -853,5 +903,6 @@ func (m *Manager) Put(ctx context.Context, path string, r io.Reader, modTime tim
 	if writeErr != nil {
 		m.log.Warn("failed to cache uploaded file locally", "path", path, "err", writeErr)
 	}
+	m.invalidateDirCache(path)
 	return m.RegisterUpload(path, size, modTime)
 }
