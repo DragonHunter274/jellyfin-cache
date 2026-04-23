@@ -376,9 +376,34 @@ func (m *Manager) bootstrapPrefetch(ctx context.Context) {
 		return
 	}
 	for _, rec := range recs {
-		if rec.State == StateUncached && !rec.PrefetchDone && !m.passthrough[rec.RemoteName] {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		switch rec.State {
+		case StateUncached:
+			if !rec.PrefetchDone && !m.passthrough[rec.RemoteName] {
+				select {
+				case m.prefetchCh <- rec.Path:
+				case <-ctx.Done():
+					return
+				}
+			}
+		case StateDownloading:
+			// Daemon was killed mid-download. Resume from the furthest point
+			// already on disk rather than restarting from the prefix boundary.
+			resumeFrom := rec.CachedBytes
+			if onDisk := m.store.Size(rec.Path); onDisk > resumeFrom {
+				resumeFrom = onDisk
+			}
+			if err := m.db.UpdateState(rec.Path, StatePrefix, resumeFrom, time.Time{}); err != nil {
+				m.log.Warn("bootstrap: failed to reset interrupted download", "path", rec.Path, "err", err)
+				continue
+			}
+			m.log.Info("resuming interrupted download", "path", rec.Path, "resume_offset", resumeFrom)
 			select {
-			case m.prefetchCh <- rec.Path:
+			case m.downloadCh <- downloadJob{path: rec.Path, ttl: m.cfg.FullTTL.Duration}:
 			case <-ctx.Done():
 				return
 			}
