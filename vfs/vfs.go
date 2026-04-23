@@ -198,7 +198,11 @@ func (fs *FS) Stat(filename string) (os.FileInfo, error) {
 	if err == nil {
 		return infoToFileInfo(rec), nil
 	}
-	// Not a known file — check whether it's a directory on any backend.
+	// Fast path: directory confirmed from a prior listing — no remote call needed.
+	if fs.mgr.IsKnownDir(filename) {
+		return &fileInfo{name: path.Base(filename), modTime: time.Now(), isDir: true}, nil
+	}
+	// Slow path: not a known file or directory — ask the remote.
 	if _, listErr := fs.mgr.List(fs.ctx, filename); listErr == nil {
 		return &fileInfo{name: path.Base(filename), modTime: time.Now(), isDir: true}, nil
 	}

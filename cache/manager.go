@@ -28,7 +28,8 @@ type Manager struct {
 	// In-memory directory listing cache (stale-while-revalidate).
 	dirMu         sync.RWMutex
 	dirCache      map[string]dirCacheEntry
-	dirRefreshing map[string]bool // dirs with a background refresh in flight
+	dirRefreshing map[string]bool   // dirs with a background refresh in flight
+	knownDirs     map[string]bool   // paths confirmed to be directories (never expires)
 
 	// Per-file download locks: prevents concurrent full downloads of the same file.
 	dlMu    sync.Mutex
@@ -101,6 +102,7 @@ func NewManager(cfg config.CacheConfig, u *union.Union, logger *slog.Logger) (*M
 		passthrough: pt,
 		dirCache:      make(map[string]dirCacheEntry),
 		dirRefreshing: make(map[string]bool),
+		knownDirs:     make(map[string]bool),
 		dlLocks:     make(map[string]*downloadLock),
 		prefetchCh:  make(chan string, 1024),
 		downloadCh:  make(chan downloadJob, 256),
@@ -468,13 +470,13 @@ func (m *Manager) walkDir(ctx context.Context, dir string, queued *int) error {
 		}
 		return nil // don't abort the whole scan for one failed directory
 	}
-	if ttl := m.cfg.DirCacheTTL.Duration; ttl > 0 {
+	if m.cfg.DirCacheTTL.Duration > 0 {
 		infos := make([]backend.Info, len(entries))
 		for i, e := range entries {
 			infos[i] = e.Info
 		}
 		m.dirMu.Lock()
-		m.dirCache[dir] = dirCacheEntry{infos: infos, expires: time.Now().Add(ttl)}
+		m.storeDirCacheLocked(dir, infos)
 		m.dirMu.Unlock()
 	}
 	for _, entry := range entries {
@@ -871,9 +873,9 @@ func (m *Manager) List(ctx context.Context, dir string) ([]backend.Info, error) 
 	if err != nil {
 		return nil, err
 	}
-	if ttl := m.cfg.DirCacheTTL.Duration; ttl > 0 {
+	if m.cfg.DirCacheTTL.Duration > 0 {
 		m.dirMu.Lock()
-		m.dirCache[dir] = dirCacheEntry{infos: infos, expires: time.Now().Add(ttl)}
+		m.storeDirCacheLocked(dir, infos)
 		m.dirMu.Unlock()
 	}
 	return infos, nil
@@ -889,7 +891,27 @@ func (m *Manager) refreshDirCache(dir string) {
 	if err != nil {
 		return
 	}
+	m.storeDirCacheLocked(dir, infos)
+}
+
+// storeDirCacheLocked stores infos under dir and marks all sub-directory
+// entries as known dirs so Stat can answer immediately.  Caller must hold dirMu.
+func (m *Manager) storeDirCacheLocked(dir string, infos []backend.Info) {
 	m.dirCache[dir] = dirCacheEntry{infos: infos, expires: time.Now().Add(m.cfg.DirCacheTTL.Duration)}
+	for _, info := range infos {
+		if info.IsDir {
+			m.knownDirs[info.Path] = true
+		}
+	}
+}
+
+// IsKnownDir reports whether path has been observed as a directory in any
+// cached listing.  Returns true instantly without a remote call.
+func (m *Manager) IsKnownDir(path string) bool {
+	m.dirMu.RLock()
+	ok := m.knownDirs[path]
+	m.dirMu.RUnlock()
+	return ok
 }
 
 func (m *Manager) invalidateDirCache(path string) {
