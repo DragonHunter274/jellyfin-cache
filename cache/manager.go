@@ -898,13 +898,35 @@ func (m *Manager) List(ctx context.Context, dir string) ([]backend.Info, error) 
 			m.dirMu.Lock()
 			if !m.dirRefreshing[dir] {
 				m.dirRefreshing[dir] = true
-				go m.refreshDirCache(dir)
+				go func() {
+					// Respect the scan semaphore: background refreshes compete for the
+					// same rclone connections as reads. If the semaphore is full, skip
+					// this cycle — the next access will retry when a slot is free.
+					select {
+					case m.scanSem <- struct{}{}:
+						defer func() { <-m.scanSem }()
+					default:
+						m.dirMu.Lock()
+						delete(m.dirRefreshing, dir)
+						m.dirMu.Unlock()
+						return
+					}
+					m.refreshDirCache(dir)
+				}()
 			}
 			m.dirMu.Unlock()
 			return entry.infos, nil
 		}
 	}
-	// Cache miss: fetch synchronously.
+	// Cache miss: fetch synchronously, bounded by scanSem to prevent
+	// concurrent Jellyfin library scans from flooding the rclone connection
+	// pool and starving passthrough reads.
+	select {
+	case m.scanSem <- struct{}{}:
+		defer func() { <-m.scanSem }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	infos, err := m.union.List(ctx, dir)
 	if err != nil {
 		return nil, err
