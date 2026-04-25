@@ -215,6 +215,50 @@ func (d *DB) DeleteNFSHandle(id [16]byte) error {
 	})
 }
 
+// BatchUpsertFiles inserts or updates a set of file records in a single
+// transaction, minimising fsync overhead when pre-populating from a directory
+// listing.  For each record:
+//   - Not in DB → inserted as-is; its path is appended to created.
+//   - In DB with empty RemoteName → RemoteName/RemotePriority updated only.
+//   - In DB with RemoteName already set → skipped (no change).
+func (d *DB) BatchUpsertFiles(recs []*FileRecord) (created []string, err error) {
+	err = d.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketFiles)
+		for _, rec := range recs {
+			existing := b.Get([]byte(rec.Path))
+			if existing == nil {
+				data, e := json.Marshal(rec)
+				if e != nil {
+					continue
+				}
+				if e := b.Put([]byte(rec.Path), data); e != nil {
+					return e
+				}
+				created = append(created, rec.Path)
+			} else {
+				var cur FileRecord
+				if e := json.Unmarshal(existing, &cur); e != nil {
+					continue
+				}
+				if cur.RemoteName != "" {
+					continue // already populated; leave it alone
+				}
+				cur.RemoteName = rec.RemoteName
+				cur.RemotePriority = rec.RemotePriority
+				data, e := json.Marshal(&cur)
+				if e != nil {
+					continue
+				}
+				if e := b.Put([]byte(cur.Path), data); e != nil {
+					return e
+				}
+			}
+		}
+		return nil
+	})
+	return created, err
+}
+
 // TotalCachedBytes sums CachedBytes across all records.
 func (d *DB) TotalCachedBytes() (int64, error) {
 	var total int64

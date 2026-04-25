@@ -533,9 +533,17 @@ func (m *Manager) walkDir(ctx context.Context, dir string, queued *int64) error 
 			continue
 		}
 		if rec != nil {
-			// If the file has migrated to a different backend, update the record so
-			// passthrough detection and prefetch routing stay correct.
-			if rec.RemoteName != "" && rec.RemoteName != entry.BackendName {
+			if rec.RemoteName == "" {
+				// Old record missing RemoteName — backfill from listing info so
+				// subsequent Stat calls don't fall through to a remote union.Stat.
+				rec.RemoteName = entry.BackendName
+				rec.RemotePriority = entry.BackendPriority
+				if err := m.db.Put(rec); err != nil {
+					m.log.Warn("scan: failed to backfill RemoteName", "path", entry.Path, "err", err)
+				}
+			} else if rec.RemoteName != entry.BackendName {
+				// File migrated to a different backend — update so passthrough
+				// detection and prefetch routing stay correct.
 				m.log.Info("scan: file migrated backend",
 					"path", entry.Path,
 					"old", rec.RemoteName,
@@ -927,10 +935,11 @@ func (m *Manager) List(ctx context.Context, dir string) ([]backend.Info, error) 
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	infos, err := m.union.List(ctx, dir)
+	tagged, err := m.union.ListTagged(ctx, dir)
 	if err != nil {
 		return nil, err
 	}
+	infos := taggedToInfos(tagged)
 	if m.cfg.DirCacheTTL.Duration > 0 {
 		m.dirMu.Lock()
 		m.storeDirCacheLocked(dir, infos)
@@ -942,20 +951,66 @@ func (m *Manager) List(ctx context.Context, dir string) ([]backend.Info, error) 
 			}
 		}
 	}
+	// Pre-populate DB records for all file entries in this directory so
+	// subsequent per-file Stat calls resolve from the DB instead of making
+	// individual remote calls.  Done synchronously while we already hold
+	// scanSem, so the records are in place before List() returns and Jellyfin
+	// starts stat-ing individual files.
+	m.populateDBFromListing(tagged)
 	return infos, nil
 }
 
 func (m *Manager) refreshDirCache(dir string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	infos, err := m.union.List(ctx, dir)
+	tagged, err := m.union.ListTagged(ctx, dir)
 	m.dirMu.Lock()
-	defer m.dirMu.Unlock()
 	delete(m.dirRefreshing, dir)
 	if err != nil {
+		m.dirMu.Unlock()
 		return
 	}
+	infos := taggedToInfos(tagged)
 	m.storeDirCacheLocked(dir, infos)
+	m.dirMu.Unlock()
+	m.populateDBFromListing(tagged)
+}
+
+// populateDBFromListing writes file entries from a directory listing into the
+// DB in a single transaction.  This ensures that when Jellyfin stats individual
+// files immediately after a ReadDir, the records are already present and no
+// per-file remote call is needed.
+func (m *Manager) populateDBFromListing(tagged []union.TaggedInfo) {
+	recs := make([]*FileRecord, 0, len(tagged))
+	for _, entry := range tagged {
+		if entry.IsDir {
+			continue
+		}
+		recs = append(recs, &FileRecord{
+			Path:           entry.Path,
+			Size:           entry.Size,
+			ModTime:        entry.ModTime,
+			State:          StateUncached,
+			Kind:           KindRemote,
+			LastAccess:     time.Now(),
+			RemoteName:     entry.BackendName,
+			RemotePriority: entry.BackendPriority,
+		})
+	}
+	if len(recs) == 0 {
+		return
+	}
+	if _, err := m.db.BatchUpsertFiles(recs); err != nil {
+		m.log.Warn("populateDBFromListing: batch upsert failed", "err", err)
+	}
+}
+
+func taggedToInfos(tagged []union.TaggedInfo) []backend.Info {
+	infos := make([]backend.Info, len(tagged))
+	for i, t := range tagged {
+		infos[i] = t.Info
+	}
+	return infos
 }
 
 // scheduleSubdirWarm kicks off a background listing of dir if it is not
