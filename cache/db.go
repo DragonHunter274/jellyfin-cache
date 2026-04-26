@@ -6,11 +6,14 @@ import (
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+
+	"jellyfin-cache/backend"
 )
 
 var (
 	bucketFiles      = []byte("files")
 	bucketNFSHandles = []byte("nfs_handles")
+	bucketDirCache   = []byte("dircache")
 )
 
 // FileRecord is the persistent metadata stored in BoltDB for every tracked
@@ -42,7 +45,7 @@ func OpenDB(path string) (*DB, error) {
 		return nil, fmt.Errorf("opening metadata db %q: %w", path, err)
 	}
 	if err := db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{bucketFiles, bucketNFSHandles} {
+		for _, name := range [][]byte{bucketFiles, bucketNFSHandles, bucketDirCache} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
@@ -145,8 +148,11 @@ func (d *DB) UpdateState(path string, state State, cachedBytes int64, expiresAt 
 }
 
 // TouchAccess updates LastAccess to now.
+// Uses db.Batch so that concurrent calls from many NFS open operations are
+// coalesced into a single transaction and fsync, avoiding per-open disk stalls
+// on network-backed PVCs.
 func (d *DB) TouchAccess(path string) error {
-	return d.db.Update(func(tx *bolt.Tx) error {
+	return d.db.Batch(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketFiles)
 		v := b.Get([]byte(path))
 		if v == nil {
@@ -257,6 +263,51 @@ func (d *DB) BatchUpsertFiles(recs []*FileRecord) (created []string, err error) 
 		return nil
 	})
 	return created, err
+}
+
+// ---- Directory listing cache persistence ------------------------------------
+//
+// Persisting the in-memory dir cache to BoltDB lets the daemon pre-warm the
+// cache on restart.  Without this, every directory listing is a synchronous
+// remote call on the first Jellyfin scan after each pod restart, which
+// serialises through the scanSem and can take 10+ minutes for large libraries.
+//
+// Entries are stored with their original expires timestamp.  Loaded entries
+// that are already expired are served via the stale-while-revalidate path
+// (instant return + background refresh) so the startup behaviour is correct.
+
+type dirCachePersistedEntry struct {
+	Infos   []backend.Info `json:"infos"`
+	Expires time.Time      `json:"expires"`
+}
+
+// SaveDirCacheEntry persists one directory listing to the dircache bucket.
+// It uses db.Batch so concurrent calls from many refreshDirCache goroutines
+// are coalesced into a small number of BoltDB transactions.
+func (d *DB) SaveDirCacheEntry(dir string, infos []backend.Info, expires time.Time) {
+	data, err := json.Marshal(dirCachePersistedEntry{Infos: infos, Expires: expires})
+	if err != nil {
+		return
+	}
+	_ = d.db.Batch(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketDirCache).Put([]byte(dir), data)
+	})
+}
+
+// LoadDirCacheEntries returns every persisted dir cache entry.
+func (d *DB) LoadDirCacheEntries() map[string]dirCachePersistedEntry {
+	out := make(map[string]dirCachePersistedEntry)
+	_ = d.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketDirCache).ForEach(func(k, v []byte) error {
+			var e dirCachePersistedEntry
+			if err := json.Unmarshal(v, &e); err != nil {
+				return nil // skip corrupt entries
+			}
+			out[string(k)] = e
+			return nil
+		})
+	})
+	return out
 }
 
 // TotalCachedBytes sums CachedBytes across all records.

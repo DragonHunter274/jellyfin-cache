@@ -16,6 +16,15 @@ import (
 	"jellyfin-cache/union"
 )
 
+// opCounters tracks interesting operation counts for periodic diagnostics.
+// All fields are accessed atomically.
+type opCounters struct {
+	statTotal   atomic.Int64 // total mgr.Stat calls
+	statRemote  atomic.Int64 // subset that hit the remote (no DB record or empty RemoteName)
+	openRemote  atomic.Int64 // CacheReader remote-fallback opens
+	listMiss    atomic.Int64 // dir-cache misses that fetched from remote
+}
+
 // Manager orchestrates the smart cache.  It is the primary entry point used
 // by the VFS layer.
 type Manager struct {
@@ -49,6 +58,10 @@ type Manager struct {
 	// Stop all background workers.
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// Diagnostic counters — snapshot-logged periodically so the user can see
+	// whether remote calls are happening during a library scan.
+	ops opCounters
 }
 
 type dirCacheEntry struct {
@@ -115,6 +128,10 @@ func NewManager(cfg config.CacheConfig, u *union.Union, logger *slog.Logger) (*M
 		cancel:      cancel,
 	}
 
+	// Pre-warm the in-memory dir cache from the previous run so the first
+	// Jellyfin scan after a restart doesn't block on remote listings.
+	m.loadPersistedDirCache()
+
 	// Start background workers.
 	for i := 0; i < cfg.PrefetchWorkers; i++ {
 		m.wg.Add(1)
@@ -135,6 +152,11 @@ func NewManager(cfg config.CacheConfig, u *union.Union, logger *slog.Logger) (*M
 	m.wg.Add(1)
 	go m.walkAndScan(ctx)
 
+	// Periodically log operation counters so users can diagnose whether
+	// remote calls are happening during Jellyfin library scans.
+	m.wg.Add(1)
+	go m.opsLogLoop(ctx)
+
 	return m, nil
 }
 
@@ -152,6 +174,8 @@ func (m *Manager) Close() error {
 // Returns an error (without a remote call) for paths confirmed to be
 // directories by any prior listing.
 func (m *Manager) Stat(ctx context.Context, path string) (*FileRecord, error) {
+	m.ops.statTotal.Add(1)
+
 	// Fast path: already confirmed as a directory by a prior listing.
 	// backend.Stat answers "is this a directory?" by listing its contents,
 	// so we must short-circuit before reaching union.Stat.
@@ -166,6 +190,8 @@ func (m *Manager) Stat(ctx context.Context, path string) (*FileRecord, error) {
 		// Records created by the background scan (walkDir) may be missing
 		// RemoteName.  Populate it lazily so passthrough detection is correct.
 		if rec.RemoteName == "" {
+			m.ops.statRemote.Add(1)
+			m.log.Info("stat: remote lookup for missing RemoteName", "path", path)
 			if _, b, err2 := m.union.Stat(ctx, path); err2 == nil {
 				rec.RemoteName = b.Name()
 				rec.RemotePriority = b.Priority()
@@ -175,6 +201,8 @@ func (m *Manager) Stat(ctx context.Context, path string) (*FileRecord, error) {
 		return rec, nil
 	}
 	// Not in DB yet – fetch from union and register.
+	m.ops.statRemote.Add(1)
+	m.log.Info("stat: remote lookup for untracked path", "path", path)
 	info, b, err := m.union.Stat(ctx, path)
 	if err != nil {
 		return nil, err
@@ -224,7 +252,11 @@ func (m *Manager) Open(ctx context.Context, path string) (io.ReadSeekCloser, err
 		return m.union.Open(ctx, path)
 	}
 
-	_ = m.db.TouchAccess(path)
+	// Run asynchronously: TouchAccess does a write transaction (fsync) which
+	// can stall for tens of milliseconds on network-backed PVCs.  The result
+	// is best-effort LRU bookkeeping and does not need to block the caller.
+	// db.Batch() inside TouchAccess coalesces concurrent calls into one fsync.
+	go m.db.TouchAccess(path)
 
 	return &CacheReader{
 		ctx:          ctx,
@@ -870,6 +902,37 @@ func parseSize(s string) (int64, error) {
 	return n, nil
 }
 
+// ---- Diagnostic counters ---------------------------------------------------
+
+// opsLogLoop logs a snapshot of operation counters every 30 s.  Non-zero
+// remote call counts during a Jellyfin library scan indicate that files are
+// being fetched from the remote rather than served from the local cache.
+func (m *Manager) opsLogLoop(ctx context.Context) {
+	defer m.wg.Done()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			st := m.ops.statTotal.Load()
+			sr := m.ops.statRemote.Load()
+			or := m.ops.openRemote.Load()
+			lm := m.ops.listMiss.Load()
+			if st == 0 && or == 0 && lm == 0 {
+				continue // nothing interesting; skip log line
+			}
+			m.log.Info("cache ops snapshot",
+				"stat_total", st,
+				"stat_remote", sr,
+				"open_remote", or,
+				"list_miss", lm,
+			)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // ---- NFS handle persistence (delegated to DB) ------------------------------
 
 func (m *Manager) LoadNFSHandles() ([][16]byte, [][]string, error) {
@@ -929,6 +992,8 @@ func (m *Manager) List(ctx context.Context, dir string) ([]backend.Info, error) 
 	// Cache miss: fetch synchronously, bounded by scanSem to prevent
 	// concurrent Jellyfin library scans from flooding the rclone connection
 	// pool and starving passthrough reads.
+	m.ops.listMiss.Add(1)
+	m.log.Debug("dir cache miss, fetching from remote", "dir", dir)
 	select {
 	case m.scanSem <- struct{}{}:
 		defer func() { <-m.scanSem }()
@@ -1041,13 +1106,42 @@ func (m *Manager) scheduleSubdirWarm(dir string) {
 
 // storeDirCacheLocked stores infos under dir and marks all sub-directory
 // entries as known dirs so Stat can answer immediately.  Caller must hold dirMu.
+// It also persists the entry to BoltDB asynchronously so restarts are fast.
 func (m *Manager) storeDirCacheLocked(dir string, infos []backend.Info) {
-	m.dirCache[dir] = dirCacheEntry{infos: infos, expires: time.Now().Add(m.cfg.DirCacheTTL.Duration)}
+	entry := dirCacheEntry{infos: infos, expires: time.Now().Add(m.cfg.DirCacheTTL.Duration)}
+	m.dirCache[dir] = entry
 	for _, info := range infos {
 		if info.IsDir {
 			m.knownDirs[info.Path] = true
 		}
 	}
+	// Persist asynchronously; db.Batch coalesces concurrent calls.
+	infosCopy := make([]backend.Info, len(infos))
+	copy(infosCopy, infos)
+	expires := entry.expires
+	go m.db.SaveDirCacheEntry(dir, infosCopy, expires)
+}
+
+// loadPersistedDirCache pre-warms the in-memory dir cache from BoltDB so
+// that the first Jellyfin scan after a pod restart does not block on remote
+// listings.  Expired entries are loaded as-is: the stale-while-revalidate
+// path in List() will serve them instantly and trigger background refreshes.
+func (m *Manager) loadPersistedDirCache() {
+	entries := m.db.LoadDirCacheEntries()
+	if len(entries) == 0 {
+		return
+	}
+	m.dirMu.Lock()
+	defer m.dirMu.Unlock()
+	for dir, e := range entries {
+		m.dirCache[dir] = dirCacheEntry{infos: e.Infos, expires: e.Expires}
+		for _, info := range e.Infos {
+			if info.IsDir {
+				m.knownDirs[info.Path] = true
+			}
+		}
+	}
+	m.log.Info("pre-warmed dir cache from persistent store", "dirs", len(entries))
 }
 
 // IsKnownDir reports whether path has been observed as a directory in any

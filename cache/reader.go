@@ -67,6 +67,17 @@ type CacheReader struct {
 	// Sliding window of recent seek timestamps for trickplay detection.
 	seekTimes []time.Time
 
+	// Cached FileRecord, refreshed at most once per recTTL.
+	//
+	// readAt() queries the DB on every call to check how many bytes are locally
+	// cached.  On network-backed PVCs each BoltDB read can cost 1–10 ms, and
+	// go-nfs issues multiple reads per NFS READ RPC, so the overhead compounds
+	// quickly during library scans.  Caching the record for a short window
+	// reduces this to ≤1 DB hit per recTTL instead of one per RPC.
+	recMu     sync.Mutex
+	cachedRec *FileRecord
+	recExpiry time.Time
+
 	// Persistent local cache file kept open between consecutive readLocalAt calls.
 	//
 	// Opening the cache file on every NFS READ RPC (open + pread + close per
@@ -90,6 +101,31 @@ type CacheReader struct {
 	remoteMu  sync.Mutex
 	remoteRC  io.ReadSeekCloser
 	remoteOff int64
+}
+
+const recTTL = 500 * time.Millisecond
+
+// getRecord returns the cached FileRecord for this path, refreshing from the
+// DB at most once per recTTL.  Returns nil if the path is not tracked.
+func (r *CacheReader) getRecord() *FileRecord {
+	r.recMu.Lock()
+	if r.cachedRec != nil && time.Now().Before(r.recExpiry) {
+		rec := r.cachedRec
+		r.recMu.Unlock()
+		return rec
+	}
+	r.recMu.Unlock()
+
+	rec, err := r.manager.db.Get(r.path)
+	if err != nil || rec == nil {
+		return nil
+	}
+
+	r.recMu.Lock()
+	r.cachedRec = rec
+	r.recExpiry = time.Now().Add(recTTL)
+	r.recMu.Unlock()
+	return rec
 }
 
 func (r *CacheReader) Read(p []byte) (int, error) {
@@ -246,8 +282,8 @@ func (r *CacheReader) recordSeek() {
 // ---- internal read helpers -------------------------------------------------
 
 func (r *CacheReader) readAt(p []byte, offset int64) (int, error) {
-	rec, err := r.manager.db.Get(r.path)
-	if err != nil || rec == nil {
+	rec := r.getRecord()
+	if rec == nil {
 		return r.readRemoteAt(p, offset)
 	}
 
@@ -369,6 +405,7 @@ func (r *CacheReader) readRemoteAt(p []byte, offset int64) (int, error) {
 // openRemoteLocked opens the union at offset and stores the reader in r.remoteRC.
 // Must be called with r.remoteMu held.
 func (r *CacheReader) openRemoteLocked(offset int64) error {
+	r.manager.ops.openRemote.Add(1)
 	r.manager.log.Info("remote fallback: opening remote connection",
 		"path", r.path,
 		"offset", offset,
