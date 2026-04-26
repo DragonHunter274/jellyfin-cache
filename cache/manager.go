@@ -211,13 +211,42 @@ func (m *Manager) Stat(ctx context.Context, path string) (*FileRecord, error) {
 		}
 		return rec, nil
 	}
-	// Not in DB: check the negative cache before making a remote call.
-	// Jellyfin probes for many sidecar files that don't exist; the neg cache
-	// prevents a round-trip per probe after the first miss.
+	// Not in DB: check caches before making a remote call.
+	// Jellyfin probes for many sidecar files (*.nfo, poster.jpg, …) that do
+	// not exist on the remote.  We use two layers to avoid remote calls:
+	//
+	//  1. Negative cache (path confirmed absent): instant reject after first miss.
+	//  2. Fresh dir listing: if the parent directory is cached and the name is
+	//     absent from the listing, the file definitely does not exist — populate
+	//     the neg cache and return immediately, with zero remote calls.
 	if m.isNegCached(path) {
 		return nil, os.ErrNotExist
 	}
-	// Not in DB, not neg-cached – fetch from union and register.
+	{
+		dir := filepath.Dir(path)
+		if dir == "." {
+			dir = ""
+		}
+		name := filepath.Base(path)
+		m.dirMu.RLock()
+		entry, hasDirEntry := m.dirCache[dir]
+		m.dirMu.RUnlock()
+		if hasDirEntry && time.Now().Before(entry.expires) {
+			// Dir listing is fresh: absent ⟹ definitely doesn't exist.
+			found := false
+			for _, info := range entry.infos {
+				if info.Name == name {
+					found = true
+					break
+				}
+			}
+			if !found {
+				m.addNegCache(path)
+				return nil, os.ErrNotExist
+			}
+		}
+	}
+	// Not in DB, not in neg/dir cache – fetch from union and register.
 	m.ops.statRemote.Add(1)
 	m.log.Info("stat: remote lookup for untracked path", "path", path)
 	info, b, err := m.union.Stat(ctx, path)
