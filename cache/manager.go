@@ -41,6 +41,16 @@ type Manager struct {
 	dirRefreshing map[string]bool // dirs with a background refresh in flight
 	knownDirs     map[string]bool // paths confirmed to be directories (never expires)
 
+	// Negative cache: paths confirmed absent from all backends.
+	//
+	// Jellyfin probes for many sidecar files (*.nfo, poster.jpg, fanart.jpg,
+	// season.nfo, tvshow.nfo, …) in every directory even when they don't exist
+	// on the remote.  Without this cache, each probe triggers two remote
+	// round-trips (union.Stat + mgr.List fallback) at ~200 ms each, turning a
+	// 500-episode library scan into a 10-15 minute ordeal.
+	negMu    sync.RWMutex
+	negCache map[string]time.Time // path → expiry
+
 	// Semaphore bounding concurrent remote directory listings (scan + eager warm).
 	scanSem chan struct{}
 
@@ -120,6 +130,7 @@ func NewManager(cfg config.CacheConfig, u *union.Union, logger *slog.Logger) (*M
 		dirCache:      make(map[string]dirCacheEntry),
 		dirRefreshing: make(map[string]bool),
 		knownDirs:     make(map[string]bool),
+		negCache:      make(map[string]time.Time),
 		scanSem:       make(chan struct{}, cfg.ScanWorkers),
 		dlLocks:     make(map[string]*downloadLock),
 		prefetchCh:  make(chan string, 1024),
@@ -200,11 +211,18 @@ func (m *Manager) Stat(ctx context.Context, path string) (*FileRecord, error) {
 		}
 		return rec, nil
 	}
-	// Not in DB yet – fetch from union and register.
+	// Not in DB: check the negative cache before making a remote call.
+	// Jellyfin probes for many sidecar files that don't exist; the neg cache
+	// prevents a round-trip per probe after the first miss.
+	if m.isNegCached(path) {
+		return nil, os.ErrNotExist
+	}
+	// Not in DB, not neg-cached – fetch from union and register.
 	m.ops.statRemote.Add(1)
 	m.log.Info("stat: remote lookup for untracked path", "path", path)
 	info, b, err := m.union.Stat(ctx, path)
 	if err != nil {
+		m.addNegCache(path)
 		return nil, err
 	}
 	// backend.Stat confirms directories by listing them; don't store a FileRecord.
@@ -269,6 +287,7 @@ func (m *Manager) Open(ctx context.Context, path string) (io.ReadSeekCloser, err
 
 // RegisterUpload records a newly uploaded file, giving it the extended TTL.
 func (m *Manager) RegisterUpload(path string, size int64, modTime time.Time) error {
+	m.invalidateNegCache(path)
 	ttl := m.cfg.UploadTTL.Duration
 	rec := &FileRecord{
 		Path:        path,
@@ -608,6 +627,7 @@ func (m *Manager) walkDir(ctx context.Context, dir string, queued *int64) error 
 			m.log.Warn("scan: db put failed", "path", entry.Path, "err", err)
 			continue
 		}
+		m.invalidateNegCache(entry.Path)
 		select {
 		case m.prefetchCh <- entry.Path:
 		default:
@@ -957,6 +977,13 @@ func (m *Manager) ReadThrough(ctx context.Context, path string) (io.ReadSeekClos
 // returned immediately and a background goroutine refreshes the cache, so
 // callers never block after the first warm-up.
 func (m *Manager) List(ctx context.Context, dir string) ([]backend.Info, error) {
+	// Short-circuit for paths confirmed absent: vfs.Stat() falls back to
+	// List() when mgr.Stat() returns an error, including for non-existent
+	// sidecar files.  Without this check that fallback would make a second
+	// remote round-trip for every missing .nfo / poster.jpg / etc.
+	if m.isNegCached(dir) {
+		return nil, os.ErrNotExist
+	}
 	if ttl := m.cfg.DirCacheTTL.Duration; ttl > 0 {
 		m.dirMu.RLock()
 		entry, ok := m.dirCache[dir]
@@ -1151,6 +1178,36 @@ func (m *Manager) IsKnownDir(path string) bool {
 	ok := m.knownDirs[path]
 	m.dirMu.RUnlock()
 	return ok
+}
+
+// negCacheTTL is how long a "not found" result is cached before the path is
+// re-checked on the remote.  15 minutes is long enough to cover many Jellyfin
+// scan cycles while still picking up genuinely new sidecar files promptly.
+const negCacheTTL = 15 * time.Minute
+
+// isNegCached reports whether path is in the negative cache (i.e. was
+// confirmed absent from all backends within the last negCacheTTL).
+func (m *Manager) isNegCached(path string) bool {
+	m.negMu.RLock()
+	exp, ok := m.negCache[path]
+	m.negMu.RUnlock()
+	return ok && time.Now().Before(exp)
+}
+
+// addNegCache records path as absent.  Called after union.Stat returns an
+// error for a path not already in the DB.
+func (m *Manager) addNegCache(path string) {
+	m.negMu.Lock()
+	m.negCache[path] = time.Now().Add(negCacheTTL)
+	m.negMu.Unlock()
+}
+
+// invalidateNegCache removes path from the negative cache.  Called when a
+// file is confirmed to exist (e.g. after an upload or walkDir discovery).
+func (m *Manager) invalidateNegCache(path string) {
+	m.negMu.Lock()
+	delete(m.negCache, path)
+	m.negMu.Unlock()
 }
 
 func (m *Manager) invalidateDirCache(path string) {
