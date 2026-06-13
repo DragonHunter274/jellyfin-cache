@@ -4,7 +4,9 @@ FROM golang:1.23-bookworm AS builder
 WORKDIR /src
 
 # Cache module downloads separately from source
+# third_party/ must come before go mod download because go.mod has a local replace for it
 COPY go.mod go.sum ./
+COPY third_party/ third_party/
 RUN go mod download
 
 COPY . .
