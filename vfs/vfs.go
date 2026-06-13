@@ -273,6 +273,21 @@ func (fs *FS) Chroot(p string) (billy.Filesystem, error) {
 
 func (fs *FS) Root() string { return "/" }
 
+// ---- billy.Change implementation -------------------------------------------
+//
+// NullAuthHandler.Change() returns this FS as the billy.Change implementation.
+// Without it, SetFileAttributes.Apply returns NFSStatusNotSupp whenever the
+// client sends a mode/ownership attribute that differs from our defaults —
+// which maps to ENOTSUPP/EOPNOTSUPP on the client, reported by .NET as
+// "No error information" (errno not in its mapping table).
+//
+// rclone backends don't store POSIX permissions, so these are accepted as
+// no-ops.
+
+func (fs *FS) Chmod(_ string, _ os.FileMode) error     { return nil }
+func (fs *FS) Lchown(_ string, _, _ int) error         { return nil }
+func (fs *FS) Lchtimes(_ string, _, _ time.Time) error { return nil }
+
 // ---- helpers ---------------------------------------------------------------
 
 func clean(p string) string {
