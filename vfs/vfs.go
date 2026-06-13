@@ -16,6 +16,8 @@ import (
 	"jellyfin-cache/cache"
 )
 
+var _ billy.Change = (*FS)(nil) // compile-time interface check
+
 // FS implements billy.Filesystem on top of the cache.Manager.
 // go-nfs uses billy.Filesystem; the FUSE layer calls the same methods.
 type FS struct {
@@ -284,9 +286,10 @@ func (fs *FS) Root() string { return "/" }
 // rclone backends don't store POSIX permissions, so these are accepted as
 // no-ops.
 
-func (fs *FS) Chmod(_ string, _ os.FileMode) error     { return nil }
-func (fs *FS) Lchown(_ string, _, _ int) error         { return nil }
-func (fs *FS) Lchtimes(_ string, _, _ time.Time) error { return nil }
+func (fs *FS) Chmod(_ string, _ os.FileMode) error    { return nil }
+func (fs *FS) Lchown(_ string, _, _ int) error        { return nil }
+func (fs *FS) Chown(_ string, _, _ int) error         { return nil }
+func (fs *FS) Chtimes(_ string, _, _ time.Time) error { return nil }
 
 // ---- helpers ---------------------------------------------------------------
 
