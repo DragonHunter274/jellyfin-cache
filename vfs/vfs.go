@@ -215,8 +215,8 @@ func (fs *FS) Rename(oldpath, newpath string) error {
 }
 
 func (fs *FS) Remove(filename string) error {
-	// TODO: propagate to union
-	return billy.ErrNotSupported
+	filename = clean(filename)
+	return fs.mgr.Remove(fs.ctx, filename)
 }
 
 func (fs *FS) Join(elem ...string) string {

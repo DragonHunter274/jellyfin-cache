@@ -1249,6 +1249,15 @@ func (m *Manager) invalidateDirCache(path string) {
 	m.dirMu.Unlock()
 }
 
+// Remove deletes a file from all backends and clears it from the local cache.
+func (m *Manager) Remove(ctx context.Context, path string) error {
+	_ = m.store.Delete(path)
+	_ = m.db.Delete(path)
+	err := m.union.Remove(ctx, path)
+	m.invalidateDirCache(path)
+	return err
+}
+
 // Mkdir creates a directory on the primary writable backend.
 func (m *Manager) Mkdir(ctx context.Context, path string) error {
 	err := m.union.Mkdir(ctx, path)
