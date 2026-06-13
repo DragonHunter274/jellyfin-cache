@@ -2,6 +2,8 @@ module jellyfin-cache
 
 go 1.23.0
 
+replace github.com/willscott/go-nfs => ./third_party/go-nfs
+
 require (
 	github.com/container-storage-interface/spec v1.12.0
 	github.com/go-git/go-billy/v5 v5.6.1
@@ -9,7 +11,7 @@ require (
 	github.com/hugelgupf/p9 v0.3.0
 	github.com/rclone/rclone v1.68.1
 	github.com/spf13/cobra v1.8.1
-	github.com/willscott/go-nfs v0.0.3
+	github.com/willscott/go-nfs v0.0.4
 	go.etcd.io/bbolt v1.3.11
 	google.golang.org/grpc v1.64.1
 	gopkg.in/yaml.v3 v3.0.1
