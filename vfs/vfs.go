@@ -4,7 +4,6 @@ package vfs
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"path"
@@ -20,15 +19,17 @@ import (
 // FS implements billy.Filesystem on top of the cache.Manager.
 // go-nfs uses billy.Filesystem; the FUSE layer calls the same methods.
 type FS struct {
-	mgr  *cache.Manager
-	ctx  context.Context
-	pool *handlePool
+	mgr   *cache.Manager
+	ctx   context.Context
+	pool  *handlePool
+	accum *writeAccumulator
 }
 
 // New creates an FS backed by the given cache.Manager.
 func New(ctx context.Context, mgr *cache.Manager) *FS {
-	fs := &FS{mgr: mgr, ctx: ctx, pool: newHandlePool()}
+	fs := &FS{mgr: mgr, ctx: ctx, pool: newHandlePool(), accum: newWriteAccumulator()}
 	go fs.pool.evictLoop(ctx)
+	go fs.accum.flushLoop(ctx)
 	return fs
 }
 
@@ -155,7 +156,8 @@ func (fs *FS) Open(filename string) (billy.File, error) {
 func (fs *FS) OpenFile(filename string, flag int, perm os.FileMode) (billy.File, error) {
 	filename = clean(filename)
 	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0 {
-		return newWriteFile(fs.ctx, fs.mgr, filename, perm)
+		create := flag&(os.O_CREATE|os.O_TRUNC) != 0
+		return fs.accum.open(fs.ctx, fs.mgr, filename, create)
 	}
 
 	// Try the pool first — avoids opening a new remote connection for every
@@ -193,6 +195,11 @@ func (fs *FS) Stat(filename string) (os.FileInfo, error) {
 	filename = clean(filename)
 	if filename == "" {
 		return &fileInfo{name: ".", modTime: time.Now(), isDir: true}, nil
+	}
+	// In-progress writes: return current accumulated size so NFS WRITE's
+	// pre-op stat succeeds before the file is flushed to the backend.
+	if size := fs.accum.stat(filename); size >= 0 {
+		return &fileInfo{name: path.Base(filename), size: size, modTime: time.Now()}, nil
 	}
 	// Check knownDirs first: backend.Stat answers "is this a dir?" by listing
 	// its contents, so we must avoid manager.Stat entirely for known directories.
@@ -347,54 +354,6 @@ func (f *readFile) Truncate(size int64) error                    { return billy.
 func (f *readFile) Lock() error                                  { return nil }
 func (f *readFile) Unlock() error                                { return nil }
 
-// ---- writeFile: pipes writes through the cache.Manager via a temp file ----
-//
-// Using a temp file instead of an in-memory buffer keeps heap usage flat for
-// large uploads (e.g. multi-GB media files).
-
-type writeFile struct {
-	ctx     context.Context
-	mgr     *cache.Manager
-	name    string
-	tmp     *os.File
-	modTime time.Time
-}
-
-func newWriteFile(ctx context.Context, mgr *cache.Manager, name string, _ os.FileMode) (*writeFile, error) {
-	tmp, err := os.CreateTemp("", "jellyfin-cache-upload-*")
-	if err != nil {
-		return nil, fmt.Errorf("creating temp file for upload of %q: %w", name, err)
-	}
-	return &writeFile{ctx: ctx, mgr: mgr, name: name, tmp: tmp, modTime: time.Now()}, nil
-}
-
-func (f *writeFile) Name() string                          { return f.name }
-func (f *writeFile) Read(p []byte) (int, error)            { return 0, billy.ErrNotSupported }
-func (f *writeFile) ReadAt(p []byte, _ int64) (int, error) { return 0, billy.ErrNotSupported }
-func (f *writeFile) Seek(_ int64, _ int) (int64, error)    { return 0, billy.ErrNotSupported }
-func (f *writeFile) Lock() error                           { return nil }
-func (f *writeFile) Unlock() error                         { return nil }
-
-func (f *writeFile) Truncate(size int64) error {
-	return f.tmp.Truncate(size)
-}
-
-func (f *writeFile) Write(p []byte) (int, error) {
-	return f.tmp.Write(p)
-}
-
-func (f *writeFile) Close() error {
-	defer os.Remove(f.tmp.Name())
-	defer f.tmp.Close()
-	if _, err := f.tmp.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	stat, err := f.tmp.Stat()
-	if err != nil {
-		return err
-	}
-	return f.mgr.Put(f.ctx, f.name, f.tmp, f.modTime, stat.Size())
-}
 
 // ---- chrootFS --------------------------------------------------------------
 
