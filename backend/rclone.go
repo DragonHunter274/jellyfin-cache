@@ -118,6 +118,13 @@ func (b *RcloneBackend) Remove(ctx context.Context, path string) error {
 	return obj.Remove(ctx)
 }
 
+func (b *RcloneBackend) Rmdir(ctx context.Context, path string) error {
+	if b.readOnly {
+		return fmt.Errorf("remote %q is read-only", b.name)
+	}
+	return b.fs.Rmdir(ctx, path)
+}
+
 func (b *RcloneBackend) Mkdir(ctx context.Context, path string) error {
 	if b.readOnly {
 		return fmt.Errorf("remote %q is read-only", b.name)

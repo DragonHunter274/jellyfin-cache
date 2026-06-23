@@ -225,6 +225,15 @@ func (fs *FS) Rename(oldpath, newpath string) error {
 
 func (fs *FS) Remove(filename string) error {
 	filename = clean(filename)
+	// go-nfs routes both REMOVE (files) and RMDIR (dirs) through this method.
+	// Directories must use Rmdir so the rclone backend calls fs.Rmdir instead
+	// of NewObject (which fails for directories with "object not found").
+	if fs.mgr.IsKnownDir(filename) {
+		return fs.mgr.Rmdir(fs.ctx, filename)
+	}
+	if info, err := fs.Stat(filename); err == nil && info.IsDir() {
+		return fs.mgr.Rmdir(fs.ctx, filename)
+	}
 	return fs.mgr.Remove(fs.ctx, filename)
 }
 

@@ -158,7 +158,10 @@ func getDirListingWithVerifier(userHandle Handler, fsHandle []byte, verifier uin
 		if os.IsPermission(err) {
 			return nil, 0, &NFSStatusError{NFSStatusAccess, err}
 		}
-		return nil, 0, &NFSStatusError{NFSStatusNotDir, err}
+		if os.IsNotExist(err) {
+			return nil, 0, &NFSStatusError{NFSStatusNoEnt, err}
+		}
+		return nil, 0, &NFSStatusError{NFSStatusIO, err}
 	}
 
 	sort.Slice(contents, func(i, j int) bool {

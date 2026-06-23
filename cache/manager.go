@@ -1010,7 +1010,10 @@ func (m *Manager) List(ctx context.Context, dir string) ([]backend.Info, error) 
 	// List() when mgr.Stat() returns an error, including for non-existent
 	// sidecar files.  Without this check that fallback would make a second
 	// remote round-trip for every missing .nfo / poster.jpg / etc.
-	if m.isNegCached(dir) {
+	// Skip the neg-cache check for confirmed directories: a race between a
+	// transient Stat failure and a concurrent listing can add a real directory
+	// to negCache, which would cause misleading ENOTDIR errors on READDIR.
+	if !m.IsKnownDir(dir) && m.isNegCached(dir) {
 		return nil, os.ErrNotExist
 	}
 	if ttl := m.cfg.DirCacheTTL.Duration; ttl > 0 {
@@ -1224,8 +1227,13 @@ func (m *Manager) isNegCached(path string) bool {
 }
 
 // addNegCache records path as absent.  Called after union.Stat returns an
-// error for a path not already in the DB.
+// error for a path not already in the DB.  Skips paths already confirmed as
+// directories to prevent a race where a concurrent goroutine adds the path to
+// knownDirs after the Stat lookup started.
 func (m *Manager) addNegCache(path string) {
+	if m.IsKnownDir(path) {
+		return
+	}
 	m.negMu.Lock()
 	m.negCache[path] = time.Now().Add(negCacheTTL)
 	m.negMu.Unlock()
@@ -1258,11 +1266,27 @@ func (m *Manager) Remove(ctx context.Context, path string) error {
 	return err
 }
 
+// Rmdir removes an empty directory from all backends and updates in-memory caches.
+func (m *Manager) Rmdir(ctx context.Context, path string) error {
+	err := m.union.Rmdir(ctx, path)
+	if err == nil {
+		m.dirMu.Lock()
+		delete(m.knownDirs, path)
+		delete(m.dirCache, path)
+		m.dirMu.Unlock()
+		m.invalidateDirCache(path) // invalidate parent
+	}
+	return err
+}
+
 // Mkdir creates a directory on the primary writable backend.
 func (m *Manager) Mkdir(ctx context.Context, path string) error {
 	err := m.union.Mkdir(ctx, path)
 	if err == nil {
 		m.invalidateDirCache(path)
+		m.dirMu.Lock()
+		m.knownDirs[path] = true
+		m.dirMu.Unlock()
 	}
 	return err
 }

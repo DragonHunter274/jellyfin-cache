@@ -157,6 +157,8 @@ func (b *MemBackend) Remove(_ context.Context, path string) error {
 	return nil
 }
 
+func (b *MemBackend) Rmdir(_ context.Context, _ string) error { return nil }
+
 func (b *MemBackend) Mkdir(_ context.Context, _ string) error { return nil }
 
 func lastName(path string) string {

@@ -246,5 +246,6 @@ func (e *errBackend) Open(_ context.Context, _ string) (io.ReadSeekCloser, error
 func (e *errBackend) Put(_ context.Context, _ string, _ io.Reader, _ time.Time, _ int64) error {
 	return context.DeadlineExceeded
 }
-func (e *errBackend) Remove(_ context.Context, _ string) error  { return context.DeadlineExceeded }
-func (e *errBackend) Mkdir(_ context.Context, _ string) error   { return context.DeadlineExceeded }
+func (e *errBackend) Remove(_ context.Context, _ string) error { return context.DeadlineExceeded }
+func (e *errBackend) Rmdir(_ context.Context, _ string) error  { return context.DeadlineExceeded }
+func (e *errBackend) Mkdir(_ context.Context, _ string) error  { return context.DeadlineExceeded }

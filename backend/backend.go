@@ -39,8 +39,11 @@ type Backend interface {
 	// modification time and size hint (-1 if unknown).
 	Put(ctx context.Context, path string, r io.Reader, modTime time.Time, size int64) error
 
-	// Remove deletes the file or empty directory at path.
+	// Remove deletes a file at path.
 	Remove(ctx context.Context, path string) error
+
+	// Rmdir removes an empty directory at path.
+	Rmdir(ctx context.Context, path string) error
 
 	// Mkdir creates a directory (and any missing parents).
 	Mkdir(ctx context.Context, path string) error

@@ -188,6 +188,26 @@ func (u *Union) Remove(ctx context.Context, path string) error {
 	return nil
 }
 
+// Rmdir removes an empty directory from all writable backends.
+func (u *Union) Rmdir(ctx context.Context, path string) error {
+	var lastErr error
+	removed := 0
+	for _, b := range u.backends {
+		if b.ReadOnly() {
+			continue
+		}
+		if err := b.Rmdir(ctx, path); err == nil {
+			removed++
+		} else {
+			lastErr = err
+		}
+	}
+	if removed == 0 && lastErr != nil {
+		return fmt.Errorf("rmdir %q: %w", path, lastErr)
+	}
+	return nil
+}
+
 // Mkdir creates path on the primary writable backend.
 func (u *Union) Mkdir(ctx context.Context, path string) error {
 	b, err := u.WriteBackend()
